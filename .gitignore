@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.env
+.pytest_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+.DS_Store
+.vscode/
+.idea/
+
+# Data / outputs
+data/
+results/*
+!results/.gitkeep
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt

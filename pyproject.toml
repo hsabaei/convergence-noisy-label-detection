@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "convergence-noisy-label-detection"
+version = "0.1.0"
+description = "Convergence-based noisy-label detection with CKL and Lyapunov-exponent monitoring."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "mpmath",
+  "torch",
+  "torchvision",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
