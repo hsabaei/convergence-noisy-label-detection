@@ -321,3 +321,199 @@ def binary_auc_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> fl
 
     auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
+
+
+def pairwise_scores_by_class(
+    score_nt: np.ndarray,
+    labels: np.ndarray,
+    *,
+    n_peers: int = 10,
+    start_index: int = 0,
+    seed: int = 66,
+):
+    """Compare each sample with same-observed-class peers over time.
+
+    Parameters
+    ----------
+    score_nt:
+        Score array in [N,T] orientation. Larger values must mean
+        "more noisy-like".
+    labels:
+        Observed labels, shape [N].
+    n_peers:
+        Number of same-class peers used per sample per epoch.
+    start_index:
+        Zero-based epoch column where pairwise monitoring begins.
+    seed:
+        Random seed controlling the per-epoch class permutations.
+
+    Returns
+    -------
+    dict with:
+        instantaneous_score [N,T]
+            Fraction of valid pairwise comparisons won at that epoch.
+        cumulative_score [N,T]
+            Fraction of all valid pairwise comparisons won from start_index
+            through the current epoch.
+        valid_comparisons [N,T]
+            Number of usable pairwise comparisons at each epoch.
+        cumulative_comparisons [N,T]
+            Cumulative number of usable comparisons.
+        cumulative_wins [N,T]
+            Cumulative pairwise win mass. Ties contribute 0.5.
+
+    Notes
+    -----
+    At every epoch and within every class, members are randomly permuted.
+    Each sample is compared with ``n_peers`` distinct cyclic offsets in that
+    permutation. This gives unique, self-excluding peers for that sample at
+    that epoch while avoiding an N x N comparison matrix.
+
+    A win is score_i > score_j. A tie contributes 0.5.
+    """
+    score = np.asarray(score_nt, dtype=np.float64)
+    labels = np.asarray(labels)
+
+    if score.ndim != 2:
+        raise ValueError(
+            f"score_nt must have shape [N,T], got {score.shape}."
+        )
+
+    N, T = score.shape
+
+    if labels.shape != (N,):
+        raise ValueError(
+            f"labels must have shape ({N},), got {labels.shape}."
+        )
+
+    n_peers = int(n_peers)
+    start_index = int(start_index)
+
+    if n_peers < 1:
+        raise ValueError("n_peers must be positive.")
+    if start_index < 0 or start_index >= T:
+        raise ValueError(
+            f"start_index must be in [0, {T-1}], got {start_index}."
+        )
+
+    classes = np.unique(labels)
+
+    for c in classes:
+        nc = int(np.sum(labels == c))
+        if nc <= n_peers:
+            raise ValueError(
+                f"Class {c} has {nc} samples, but n_peers={n_peers}; "
+                "need class size > n_peers."
+            )
+
+    instantaneous = np.full(
+        (N, T),
+        np.nan,
+        dtype=np.float64,
+    )
+    cumulative = np.full(
+        (N, T),
+        np.nan,
+        dtype=np.float64,
+    )
+    valid_comparisons = np.zeros(
+        (N, T),
+        dtype=np.int16,
+    )
+    cumulative_comparisons = np.zeros(
+        (N, T),
+        dtype=np.int32,
+    )
+    cumulative_wins = np.zeros(
+        (N, T),
+        dtype=np.float64,
+    )
+
+    running_wins = np.zeros(N, dtype=np.float64)
+    running_count = np.zeros(N, dtype=np.int32)
+
+    rng = np.random.default_rng(int(seed))
+
+    class_members = {
+        c: np.flatnonzero(labels == c)
+        for c in classes
+    }
+
+    for t in range(start_index, T):
+
+        wins_t = np.zeros(N, dtype=np.float64)
+        count_t = np.zeros(N, dtype=np.int16)
+
+        for c in classes:
+
+            members = class_members[c]
+            nc = members.size
+
+            # Fresh peer assignment at every epoch.
+            perm = rng.permutation(members)
+
+            # Distinct offsets ensure no repeated peer for the same sample
+            # during this epoch, and offset 0 is excluded to avoid self-pairs.
+            offsets = rng.choice(
+                np.arange(1, nc, dtype=np.int64),
+                size=n_peers,
+                replace=False,
+            )
+
+            x_i = score[perm, t]
+
+            for offset in offsets:
+                peers = np.roll(perm, int(offset))
+                x_j = score[peers, t]
+
+                valid = (
+                    np.isfinite(x_i)
+                    & np.isfinite(x_j)
+                )
+
+                if not np.any(valid):
+                    continue
+
+                ii = perm[valid]
+                vi = x_i[valid]
+                vj = x_j[valid]
+
+                win_mass = np.where(
+                    vi > vj,
+                    1.0,
+                    np.where(vi == vj, 0.5, 0.0),
+                )
+
+                wins_t[ii] += win_mass
+                count_t[ii] += 1
+
+        usable = count_t > 0
+
+        instantaneous[usable, t] = (
+            wins_t[usable]
+            / count_t[usable]
+        )
+
+        running_wins += wins_t
+        running_count += count_t.astype(np.int32)
+
+        cumulative_wins[:, t] = running_wins
+        cumulative_comparisons[:, t] = running_count
+        valid_comparisons[:, t] = count_t
+
+        cumulative_usable = running_count > 0
+        cumulative[cumulative_usable, t] = (
+            running_wins[cumulative_usable]
+            / running_count[cumulative_usable]
+        )
+
+    return {
+        "instantaneous_score": instantaneous,
+        "cumulative_score": cumulative,
+        "valid_comparisons": valid_comparisons,
+        "cumulative_comparisons": cumulative_comparisons,
+        "cumulative_wins": cumulative_wins,
+        "n_peers": int(n_peers),
+        "start_index": int(start_index),
+        "seed": int(seed),
+    }

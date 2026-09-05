@@ -1132,3 +1132,50 @@ def rolling_proposed_le_batch(
         "K": int(K),
         "limit_method": limit_method,
     }
+
+
+def compose_le_from_error_and_m(
+    ell_err_hat,
+    m_hat,
+):
+    """Compose the proposed LE from an error term and any valid m estimate.
+
+    The theoretical form is
+
+        ell_hat = ell_err_hat + log(abs(m_hat)).
+
+    ``m_hat`` may come from FIE, GIE, or another estimator of the same
+    convergence-order/LID quantity.  Scalars and NumPy arrays are supported.
+    Invalid/nonfinite inputs and m_hat == 0 produce NaN.
+    """
+    ell = np.asarray(ell_err_hat, dtype=np.float64)
+    m = np.asarray(m_hat, dtype=np.float64)
+
+    ell_b, m_b = np.broadcast_arrays(ell, m)
+
+    out = np.full(
+        ell_b.shape,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    valid = (
+        np.isfinite(ell_b)
+        & np.isfinite(m_b)
+        & (m_b != 0.0)
+    )
+
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+    ):
+        out[valid] = (
+            ell_b[valid]
+            + np.log(np.abs(m_b[valid]))
+        )
+
+    if out.ndim == 0:
+        return float(out)
+
+    return out
