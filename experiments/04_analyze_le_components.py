@@ -53,6 +53,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from convergence_monitoring.framework import standardize_monitoring_score
+from convergence_monitoring.estimators import rolling_class_reference_gie_batch
 
 
 # ---------------------------------------------------------------------
@@ -80,6 +81,26 @@ def parse_args():
             "proposed_le_score_trajectories.npz"
         ),
         help="Corrected Proposed-Aitken-Guarded K=20 NPZ.",
+    )
+    parser.add_argument(
+        "--common-npz",
+        type=Path,
+        default=Path(
+            "results/common_loss_trajectories/"
+            "cifar10_noisy_label_loss_trajectories.npz"
+        ),
+        help="Common loss-trajectory artifact used to compute class-reference GIE.",
+    )
+    parser.add_argument(
+        "--gie-K",
+        type=int,
+        default=20,
+        help="Rolling class-reference GIE window length.",
+    )
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=10,
     )
     parser.add_argument(
         "--output-dir",
@@ -663,6 +684,531 @@ def plot_weighted_early_auc(weighted_rows, variant, out_path):
     plt.close(fig)
 
 
+
+# ---------------------------------------------------------------------
+# Class-reference GIE analysis
+# ---------------------------------------------------------------------
+
+def load_common_loss_artifact(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Common loss NPZ not found: {path}"
+        )
+
+    d = np.load(path, allow_pickle=False)
+
+    required = [
+        "loss_traj",
+        "epoch",
+        "observed_label",
+        "is_anomaly",
+    ]
+    missing = [k for k in required if k not in d.files]
+    if missing:
+        raise KeyError(
+            f"Common loss NPZ is missing required arrays: {missing}"
+        )
+
+    return {
+        "loss_traj": np.asarray(d["loss_traj"], dtype=np.float64),
+        "epoch": np.asarray(d["epoch"], dtype=np.int64),
+        "observed_label": np.asarray(
+            d["observed_label"],
+            dtype=np.int64,
+        ),
+        "is_anomaly": np.asarray(
+            d["is_anomaly"],
+            dtype=bool,
+        ),
+    }
+
+
+def validate_common_against_le(common, v):
+    if not np.array_equal(common["epoch"], v["epoch"]):
+        raise ValueError(
+            f"{v['name']}: epochs differ from common loss artifact."
+        )
+
+    if not np.array_equal(
+        common["observed_label"],
+        v["observed_label"],
+    ):
+        raise ValueError(
+            f"{v['name']}: observed labels differ from common loss artifact."
+        )
+
+    if not np.array_equal(
+        common["is_anomaly"],
+        v["is_anomaly"],
+    ):
+        raise ValueError(
+            f"{v['name']}: noisy-label mask differs from common loss artifact."
+        )
+
+
+def summarize_single_component(
+    name,
+    values,
+    epochs,
+    is_anomaly,
+):
+    rows = []
+
+    for t_idx, ep in enumerate(epochs):
+        vals = values[:, t_idx]
+        auc_h, auc_l = auc_pair(is_anomaly, vals)
+        med_clean, med_noisy, n_clean, n_noisy = median_by_group(
+            vals,
+            is_anomaly,
+        )
+
+        rows.append({
+            "component": name,
+            "epoch": int(ep),
+            "auc_higher_is_noisy": auc_h,
+            "auc_lower_is_noisy": auc_l,
+            "median_clean": med_clean,
+            "median_noisy": med_noisy,
+            "median_noisy_minus_clean": (
+                med_noisy - med_clean
+                if np.isfinite(med_clean)
+                and np.isfinite(med_noisy)
+                else np.nan
+            ),
+            "n_finite_clean": n_clean,
+            "n_finite_noisy": n_noisy,
+            "finite_fraction": (
+                (n_clean + n_noisy) / len(is_anomaly)
+            ),
+        })
+
+    return rows
+
+
+def best_single_component_rows(rows):
+    out = []
+
+    for component in sorted(set(r["component"] for r in rows)):
+        subset = [
+            r for r in rows
+            if r["component"] == component
+        ]
+
+        for col, direction in (
+            ("auc_higher_is_noisy", "higher_is_noisy"),
+            ("auc_lower_is_noisy", "lower_is_noisy"),
+        ):
+            finite = [
+                r for r in subset
+                if np.isfinite(r[col])
+            ]
+            if not finite:
+                continue
+
+            best = max(
+                finite,
+                key=lambda r: r[col],
+            )
+
+            out.append({
+                "component": component,
+                "direction": direction,
+                "best_auc": best[col],
+                "best_epoch": best["epoch"],
+                "median_clean_at_best": best["median_clean"],
+                "median_noisy_at_best": best["median_noisy"],
+                "finite_fraction_at_best": best["finite_fraction"],
+            })
+
+    return out
+
+
+def build_weighted_scores_external_id(
+    v,
+    log_abs_id_external,
+    *,
+    num_classes=10,
+):
+    """Build S_alpha = z(ell_err) + alpha*z(external log|ID|)."""
+    labels = v["observed_label"]
+
+    finite_le = np.any(
+        np.isfinite(v["ell_err"]),
+        axis=0,
+    )
+    finite_id = np.any(
+        np.isfinite(log_abs_id_external),
+        axis=0,
+    )
+
+    common_cols = np.flatnonzero(
+        finite_le & finite_id
+    )
+    if common_cols.size == 0:
+        raise ValueError(
+            f"{v['name']}: no overlapping finite ell_err and GIE columns."
+        )
+
+    first_col = int(common_cols[0])
+
+    z_err = standardize_monitoring_score(
+        v["ell_err"].T,
+        labels,
+        direction="higher",
+        num_classes=num_classes,
+        start_index=first_col,
+    ).T
+
+    z_id = standardize_monitoring_score(
+        log_abs_id_external.T,
+        labels,
+        direction="higher",
+        num_classes=num_classes,
+        start_index=first_col,
+    ).T
+
+    scores = {
+        float(alpha):
+            z_err + float(alpha) * z_id
+        for alpha in WEIGHT_ALPHAS
+    }
+
+    return {
+        "first_available_column": first_col,
+        "z_err": z_err,
+        "z_id": z_id,
+        "scores": scores,
+    }
+
+
+def summarize_weighted_scores_named(
+    v,
+    weighted,
+    id_source,
+):
+    rows = []
+    y = v["is_anomaly"]
+
+    for alpha, score in weighted["scores"].items():
+        for t_idx, ep in enumerate(v["epoch"]):
+            vals = score[:, t_idx]
+            auc_h, auc_l = auc_pair(y, vals)
+            med_clean, med_noisy, n_clean, n_noisy = median_by_group(
+                vals,
+                y,
+            )
+
+            rows.append({
+                "variant": v["name"],
+                "id_source": id_source,
+                "alpha": float(alpha),
+                "epoch": int(ep),
+                "auc_higher_is_noisy": auc_h,
+                "auc_lower_is_noisy": auc_l,
+                "median_clean": med_clean,
+                "median_noisy": med_noisy,
+                "median_noisy_minus_clean": (
+                    med_noisy - med_clean
+                    if np.isfinite(med_clean)
+                    and np.isfinite(med_noisy)
+                    else np.nan
+                ),
+                "n_finite_clean": n_clean,
+                "n_finite_noisy": n_noisy,
+            })
+
+    return rows
+
+
+def summarize_weighted_named_best(rows):
+    out = []
+    keys = sorted(
+        set(
+            (
+                r["variant"],
+                r["id_source"],
+                float(r["alpha"]),
+            )
+            for r in rows
+        )
+    )
+
+    for variant, id_source, alpha in keys:
+        subset = [
+            r for r in rows
+            if r["variant"] == variant
+            and r["id_source"] == id_source
+            and float(r["alpha"]) == alpha
+        ]
+
+        for col, direction in (
+            ("auc_higher_is_noisy", "higher_is_noisy"),
+            ("auc_lower_is_noisy", "lower_is_noisy"),
+        ):
+            finite = [
+                r for r in subset
+                if np.isfinite(r[col])
+            ]
+            if not finite:
+                continue
+
+            best = max(
+                finite,
+                key=lambda r: r[col],
+            )
+
+            out.append({
+                "variant": variant,
+                "id_source": id_source,
+                "alpha": alpha,
+                "direction": direction,
+                "best_auc": best[col],
+                "best_epoch": best["epoch"],
+                "median_clean_at_best": best["median_clean"],
+                "median_noisy_at_best": best["median_noisy"],
+            })
+
+    return out
+
+
+def summarize_weighted_named_windows(rows):
+    windows = (
+        (22, 30),
+        (22, 40),
+        (22, 60),
+    )
+
+    out = []
+    keys = sorted(
+        set(
+            (
+                r["variant"],
+                r["id_source"],
+                float(r["alpha"]),
+            )
+            for r in rows
+        )
+    )
+
+    for variant, id_source, alpha in keys:
+        subset = [
+            r for r in rows
+            if r["variant"] == variant
+            and r["id_source"] == id_source
+            and float(r["alpha"]) == alpha
+        ]
+
+        for start_ep, end_ep in windows:
+            rr = [
+                r for r in subset
+                if start_ep <= int(r["epoch"]) <= end_ep
+                and np.isfinite(r["auc_higher_is_noisy"])
+            ]
+            if not rr:
+                continue
+
+            aucs = np.asarray(
+                [r["auc_higher_is_noisy"] for r in rr],
+                dtype=np.float64,
+            )
+
+            out.append({
+                "variant": variant,
+                "id_source": id_source,
+                "alpha": alpha,
+                "start_epoch": start_ep,
+                "end_epoch": end_ep,
+                "mean_auc_higher_is_noisy": float(np.mean(aucs)),
+                "median_auc_higher_is_noisy": float(np.median(aucs)),
+                "min_auc_higher_is_noisy": float(np.min(aucs)),
+                "max_auc_higher_is_noisy": float(np.max(aucs)),
+                "n_epochs": int(aucs.size),
+            })
+
+    return out
+
+
+def summarize_gie_augmented_score(
+    v,
+    log_abs_gie,
+):
+    """Analyze ell_err + log|ID_GIE|.
+
+    This is intentionally called a GIE-augmented detection score, not an LE.
+    """
+    score = v["ell_err"] + log_abs_gie
+    rows = []
+
+    for t_idx, ep in enumerate(v["epoch"]):
+        vals = score[:, t_idx]
+        auc_h, auc_l = auc_pair(
+            v["is_anomaly"],
+            vals,
+        )
+        med_clean, med_noisy, n_clean, n_noisy = median_by_group(
+            vals,
+            v["is_anomaly"],
+        )
+
+        rows.append({
+            "variant": v["name"],
+            "score": "ell_err_plus_log_abs_id_gie",
+            "epoch": int(ep),
+            "auc_higher_is_noisy": auc_h,
+            "auc_lower_is_noisy": auc_l,
+            "median_clean": med_clean,
+            "median_noisy": med_noisy,
+            "n_finite_clean": n_clean,
+            "n_finite_noisy": n_noisy,
+        })
+
+    return rows
+
+
+def plot_id_fie_vs_gie(
+    next_v,
+    aitken_v,
+    log_abs_gie,
+    out_path,
+):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    series = (
+        (
+            "FIE — next",
+            next_v["log_abs_id"],
+            next_v["is_anomaly"],
+        ),
+        (
+            "FIE — guarded Aitken",
+            aitken_v["log_abs_id"],
+            aitken_v["is_anomaly"],
+        ),
+        (
+            "class-reference GIE",
+            log_abs_gie,
+            next_v["is_anomaly"],
+        ),
+    )
+
+    for label, arr, y in series:
+        aucs = [
+            auc_pair(y, arr[:, t])[0]
+            for t in range(arr.shape[1])
+        ]
+        ax.plot(
+            next_v["epoch"],
+            aucs,
+            label=label,
+        )
+
+    ax.axhline(0.5, linewidth=1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ROC-AUC (higher log|ID| = noisy)")
+    ax.set_title("FIE vs class-reference GIE component AUC")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_gie_augmented_vs_le(
+    v,
+    log_abs_gie,
+    out_path,
+):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    auc_le = [
+        auc_pair(
+            v["is_anomaly"],
+            v["lambda"][:, t],
+        )[0]
+        for t in range(v["lambda"].shape[1])
+    ]
+
+    gie_score = (
+        v["ell_err"]
+        + log_abs_gie
+    )
+    auc_gie = [
+        auc_pair(
+            v["is_anomaly"],
+            gie_score[:, t],
+        )[0]
+        for t in range(gie_score.shape[1])
+    ]
+
+    ax.plot(
+        v["epoch"],
+        auc_le,
+        label="theoretical LE with FIE",
+    )
+    ax.plot(
+        v["epoch"],
+        auc_gie,
+        label="ell_err + log|ID_GIE|",
+    )
+
+    ax.axhline(0.5, linewidth=1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ROC-AUC (higher score = noisy)")
+    ax.set_title(
+        f"FIE LE vs GIE-augmented score — {v['name']}"
+    )
+    ax.set_ylim(0.0, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_weighted_fie_vs_gie(
+    fie_rows,
+    gie_rows,
+    variant,
+    alpha,
+    out_path,
+):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    rr_fie = [
+        r for r in fie_rows
+        if r["variant"] == variant
+        and float(r["alpha"]) == float(alpha)
+    ]
+    rr_gie = [
+        r for r in gie_rows
+        if r["variant"] == variant
+        and r["id_source"] == "gie"
+        and float(r["alpha"]) == float(alpha)
+    ]
+
+    ax.plot(
+        [r["epoch"] for r in rr_fie],
+        [r["auc_higher_is_noisy"] for r in rr_fie],
+        label=f"FIE alpha={alpha:g}",
+    )
+    ax.plot(
+        [r["epoch"] for r in rr_gie],
+        [r["auc_higher_is_noisy"] for r in rr_gie],
+        label=f"GIE alpha={alpha:g}",
+    )
+
+    ax.axhline(0.5, linewidth=1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ROC-AUC (higher weighted score = noisy)")
+    ax.set_title(
+        f"Weighted FIE vs GIE — {variant}, alpha={alpha:g}"
+    )
+    ax.set_ylim(0.0, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------
@@ -824,6 +1370,52 @@ def main():
     ):
         raise ValueError("Noisy-label masks differ between variants.")
 
+    # --------------------------------------------------------------
+    # Compute class-reference GIE once from the common loss artifact.
+    # G_i(t) is the mean loss trajectory of samples sharing observed label.
+    # --------------------------------------------------------------
+
+    common = load_common_loss_artifact(args.common_npz)
+    validate_common_against_le(common, next_v)
+    validate_common_against_le(common, aitken_v)
+
+    gie = rolling_class_reference_gie_batch(
+        common["loss_traj"],
+        common["observed_label"],
+        K=args.gie_K,
+        num_classes=args.num_classes,
+    )
+
+    id_gie = np.asarray(
+        gie["id_gie_traj"],
+        dtype=np.float64,
+    )
+    log_abs_gie = safe_log_abs(id_gie)
+
+    gie_component_rows = summarize_single_component(
+        "log_abs_id_gie",
+        log_abs_gie,
+        common["epoch"],
+        common["is_anomaly"],
+    )
+    write_csv(
+        args.output_dir / "gie_component_epoch_summary.csv",
+        gie_component_rows,
+    )
+    write_csv(
+        args.output_dir / "gie_component_best_auc_summary.csv",
+        best_single_component_rows(gie_component_rows),
+    )
+
+    gie_augmented_rows = (
+        summarize_gie_augmented_score(next_v, log_abs_gie)
+        + summarize_gie_augmented_score(aitken_v, log_abs_gie)
+    )
+    write_csv(
+        args.output_dir / "gie_augmented_score_epoch_summary.csv",
+        gie_augmented_rows,
+    )
+
     rows = (
         summarize_variant(next_v)
         + summarize_variant(aitken_v)
@@ -879,6 +1471,47 @@ def main():
     write_csv(
         args.output_dir / "weighted_score_early_window_summary.csv",
         weighted_windows,
+    )
+
+    # --------------------------------------------------------------
+    # Same prespecified alpha grid, replacing FIE with class-reference GIE.
+    # --------------------------------------------------------------
+
+    next_weighted_gie = build_weighted_scores_external_id(
+        next_v,
+        log_abs_gie,
+        num_classes=args.num_classes,
+    )
+    aitken_weighted_gie = build_weighted_scores_external_id(
+        aitken_v,
+        log_abs_gie,
+        num_classes=args.num_classes,
+    )
+
+    weighted_gie_rows = (
+        summarize_weighted_scores_named(
+            next_v,
+            next_weighted_gie,
+            "gie",
+        )
+        + summarize_weighted_scores_named(
+            aitken_v,
+            aitken_weighted_gie,
+            "gie",
+        )
+    )
+
+    write_csv(
+        args.output_dir / "weighted_gie_score_epoch_summary.csv",
+        weighted_gie_rows,
+    )
+    write_csv(
+        args.output_dir / "weighted_gie_score_best_auc_summary.csv",
+        summarize_weighted_named_best(weighted_gie_rows),
+    )
+    write_csv(
+        args.output_dir / "weighted_gie_score_early_window_summary.csv",
+        summarize_weighted_named_windows(weighted_gie_rows),
     )
 
     validity_rows = []
@@ -968,6 +1601,37 @@ def main():
         args.output_dir / "fig_weighted_auc_early_aitken.png",
     )
 
+    plot_id_fie_vs_gie(
+        next_v,
+        aitken_v,
+        log_abs_gie,
+        args.output_dir / "fig_id_component_auc_fie_vs_gie.png",
+    )
+    plot_gie_augmented_vs_le(
+        next_v,
+        log_abs_gie,
+        args.output_dir / "fig_gie_augmented_vs_le_next.png",
+    )
+    plot_gie_augmented_vs_le(
+        aitken_v,
+        log_abs_gie,
+        args.output_dir / "fig_gie_augmented_vs_le_aitken.png",
+    )
+    plot_weighted_fie_vs_gie(
+        weighted_rows,
+        weighted_gie_rows,
+        "aitken_guarded",
+        0.25,
+        args.output_dir / "fig_weighted_fie_vs_gie_aitken_alpha025.png",
+    )
+    plot_weighted_fie_vs_gie(
+        weighted_rows,
+        weighted_gie_rows,
+        "aitken_guarded",
+        1.0,
+        args.output_dir / "fig_weighted_fie_vs_gie_aitken_alpha1.png",
+    )
+
     print("========================================")
     print("LE component diagnostic complete")
     print("========================================")
@@ -991,6 +1655,28 @@ def main():
             print(
                 f"{r['variant']:>16s} | "
                 f"alpha={r['alpha']:<4g} | "
+                f"best AUC={r['best_auc']:.6f} "
+                f"at epoch {r['best_epoch']}"
+            )
+
+    print()
+    print("GIE component / weighted-score results:")
+    gie_best = best_single_component_rows(gie_component_rows)
+    for r in gie_best:
+        if r["direction"] == "higher_is_noisy":
+            print(
+                f"{r['component']:>20s} | "
+                f"best AUC={r['best_auc']:.6f} "
+                f"at epoch {r['best_epoch']}"
+            )
+
+    for r in summarize_weighted_named_best(weighted_gie_rows):
+        if (
+            r["variant"] == "aitken_guarded"
+            and r["direction"] == "higher_is_noisy"
+        ):
+            print(
+                f"GIE weighted | alpha={r['alpha']:<4g} | "
                 f"best AUC={r['best_auc']:.6f} "
                 f"at epoch {r['best_epoch']}"
             )

@@ -1177,3 +1177,269 @@ def compute_lrt_direct_plugin(
         "limit_trim_eta": float(limit_trim_eta) if limit_trim_eta is not None else np.nan,
     }
 
+
+# ============================================================
+# Class-reference GIE utilities for noisy-label monitoring
+# ============================================================
+
+def build_class_reference_trajectory(
+    loss_traj: np.ndarray,
+    observed_label: np.ndarray,
+    num_classes: int = 10,
+) -> np.ndarray:
+    """Return class-mean loss trajectories in [N,T] orientation.
+
+    For sample i with observed label c, every epoch uses
+
+        G_i(t) = mean_j loss_j(t),  over j with observed_label_j = c.
+
+    This matches the class-reference construction already used by the CKL
+    experiment.  The sample itself is included in the class mean.
+    """
+    x = np.asarray(loss_traj, dtype=np.float64)
+    labels = np.asarray(observed_label, dtype=np.int64)
+
+    if x.ndim != 2:
+        raise ValueError(
+            f"loss_traj must have shape [N,T], got {x.shape}."
+        )
+
+    N, T = x.shape
+    if labels.shape != (N,):
+        raise ValueError(
+            f"observed_label must have shape ({N},), got {labels.shape}."
+        )
+
+    G = np.full((N, T), np.nan, dtype=np.float64)
+
+    for c in range(int(num_classes)):
+        idx = labels == c
+        if not np.any(idx):
+            continue
+
+        with np.errstate(invalid="ignore"):
+            mean_t = np.nanmean(x[idx], axis=0)
+
+        G[idx] = mean_t[None, :]
+
+    return G
+
+
+def vectorized_gie_window(
+    phi: np.ndarray,
+    G: np.ndarray,
+    eps: float = EPS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized row-wise version of ``LIDEstimators.compute_GIE_LID``.
+
+    Parameters
+    ----------
+    phi, G:
+        Matching arrays with shape [N,K].
+
+    Returns
+    -------
+    d, W:
+        GIE estimate and sample boundary for each row.
+
+    Notes
+    -----
+    The limit convention matches the existing CKL/GIE implementation:
+    the mean of the final three observations in the current window.
+    """
+    phi = np.asarray(phi, dtype=np.float64)
+    G = np.asarray(G, dtype=np.float64)
+
+    if phi.shape != G.shape or phi.ndim != 2:
+        raise ValueError(
+            "phi and G must have matching shape [N,K]."
+        )
+
+    N, _ = phi.shape
+    epsilon = float(EPS)
+
+    phi_limit = np.mean(phi[:, -3:], axis=1)
+    G_limit = np.mean(G[:, -3:], axis=1)
+
+    R = np.abs(phi - phi_limit[:, None])
+    FR = np.abs(G - G_limit[:, None])
+
+    with np.errstate(invalid="ignore"):
+        w0 = np.max(R, axis=1)
+        w1 = np.max(FR, axis=1)
+
+    W = w0.copy()
+    d = np.full(N, np.nan, dtype=np.float64)
+
+    # Paired filtering, matching compute_GIE_LID.
+    mask = (
+        (R > eps)
+        & (FR > eps)
+        & np.isfinite(R)
+        & np.isfinite(FR)
+    )
+
+    n_nonzero = mask.sum(axis=1)
+    k_internal = n_nonzero - 1
+
+    base_ok = (
+        (k_internal > 4)
+        & np.isfinite(w0)
+        & np.isfinite(w1)
+        & (w0 > 0.0)
+        & (w1 > 0.0)
+    )
+
+    if not np.any(base_ok):
+        return d, W
+
+    safe_w0 = np.where(
+        base_ok,
+        w0 + epsilon,
+        1.0,
+    )
+    safe_w1 = np.where(
+        base_ok,
+        w1 + epsilon,
+        1.0,
+    )
+
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+    ):
+        log_num = np.where(
+            mask,
+            np.log(np.abs(R / safe_w0[:, None])),
+            0.0,
+        )
+        log_den = np.where(
+            mask,
+            np.log(np.abs(FR / safe_w1[:, None])),
+            0.0,
+        )
+
+    denom_num = np.sum(log_num, axis=1)
+    denom_den = np.sum(log_den, axis=1)
+
+    ok = (
+        base_ok
+        & np.isfinite(denom_num)
+        & np.isfinite(denom_den)
+        & (np.abs(denom_num) >= eps)
+        & (np.abs(denom_den) >= eps)
+    )
+
+    if not np.any(ok):
+        return d, W
+
+    hill_num = np.full(N, np.nan, dtype=np.float64)
+    hill_den = np.full(N, np.nan, dtype=np.float64)
+
+    hill_num[ok] = -(k_internal[ok] / denom_num[ok])
+    hill_den[ok] = -(k_internal[ok] / denom_den[ok])
+
+    good = (
+        ok
+        & np.isfinite(hill_num)
+        & np.isfinite(hill_den)
+        & (np.abs(hill_den) > eps)
+    )
+
+    d[good] = hill_num[good] / hill_den[good]
+    return d, W
+
+
+def rolling_class_reference_gie_batch(
+    loss_traj: np.ndarray,
+    observed_label: np.ndarray,
+    K: int = 20,
+    num_classes: int = 10,
+) -> Dict[str, np.ndarray]:
+    """Compute rolling class-reference GIE trajectories.
+
+    The sample trajectory is ``phi_i`` and the reference trajectory is the
+    mean loss trajectory of the sample's observed CIFAR-10 class.
+
+    This is a detection/diagnostic GIE quantity.  It is not substituted into
+    the theoretical LE definition by this function.
+    """
+    x = np.asarray(loss_traj, dtype=np.float64)
+    labels = np.asarray(observed_label, dtype=np.int64)
+
+    if x.ndim != 2:
+        raise ValueError(
+            f"loss_traj must have shape [N,T], got {x.shape}."
+        )
+
+    N, T = x.shape
+
+    if labels.shape != (N,):
+        raise ValueError(
+            f"observed_label must have shape ({N},), got {labels.shape}."
+        )
+
+    K = int(K)
+    if K < 6:
+        raise ValueError(
+            "K must be at least 6 for the existing GIE estimator."
+        )
+    if T < K:
+        raise ValueError(
+            f"Need at least K={K} observations; found T={T}."
+        )
+
+    G = build_class_reference_trajectory(
+        x,
+        labels,
+        num_classes=int(num_classes),
+    )
+
+    id_gie_traj = np.full(
+        (N, T),
+        np.nan,
+        dtype=np.float64,
+    )
+    W_gie_traj = np.full(
+        (N, T),
+        np.nan,
+        dtype=np.float64,
+    )
+    valid_traj = np.zeros(
+        (N, T),
+        dtype=bool,
+    )
+
+    first_col = K - 1
+
+    for t in range(first_col, T):
+        start = t - K + 1
+
+        phi_w = x[:, start:t + 1]
+        G_w = G[:, start:t + 1]
+
+        d_t, W_t = vectorized_gie_window(
+            phi_w,
+            G_w,
+            eps=EPS,
+        )
+
+        valid = (
+            np.isfinite(d_t)
+            & (d_t != 0.0)
+        )
+
+        id_gie_traj[valid, t] = d_t[valid]
+        W_gie_traj[np.isfinite(W_t), t] = W_t[np.isfinite(W_t)]
+        valid_traj[valid, t] = True
+
+    return {
+        "id_gie_traj": id_gie_traj,
+        "W_gie_traj": W_gie_traj,
+        "valid_traj": valid_traj,
+        "first_available_column": int(first_col),
+        "first_available_epoch": int(first_col + 1),
+        "K": int(K),
+        "reference": "observed-class mean loss trajectory",
+    }
