@@ -55,6 +55,7 @@ import matplotlib.pyplot as plt
 from convergence_monitoring.detectors import (
     binary_auc_from_scores,
     pairwise_scores_by_class,
+    exact_pairwise_scores_by_class,
 )
 from convergence_monitoring.estimators import (
     rolling_class_reference_gie_batch,
@@ -467,7 +468,7 @@ def plot_auc(
         "ROC-AUC (higher score = noisy)"
     )
     ax.set_title(
-        "CKL vs direct and pairwise LE-GIE"
+        "CKL vs sampled/exact pairwise LE-GIE and CKL"
     )
     ax.set_ylim(0.0, 1.0)
     ax.legend()
@@ -763,12 +764,78 @@ def main():
         dtype=np.float64,
     )
 
+    # --------------------------------------------------------------
+    # Exact all-peer same-class pairwise LE-GIE.
+    # This removes Monte Carlo noise from M=10 sampling and gives the
+    # exact within-class pairwise percentile at each epoch.
+    # --------------------------------------------------------------
+
+    pairwise_exact_le = exact_pairwise_scores_by_class(
+        le_gie,
+        labels,
+        start_index=common_start_col,
+    )
+
+    pair_exact_le_inst = np.asarray(
+        pairwise_exact_le["instantaneous_score"],
+        dtype=np.float64,
+    )
+    pair_exact_le_cum = np.asarray(
+        pairwise_exact_le["cumulative_score"],
+        dtype=np.float64,
+    )
+
+    # --------------------------------------------------------------
+    # Symmetric CKL pairwise comparisons.
+    #
+    # CKL raw and class-wise z(CKL) have the same within-class ordering
+    # at a fixed epoch, so raw CKL is sufficient for the pairwise rule.
+    # --------------------------------------------------------------
+
+    pairwise_ckl_sampled = pairwise_scores_by_class(
+        ckl_raw,
+        labels,
+        n_peers=args.n_peers,
+        start_index=common_start_col,
+        seed=args.pairwise_seed,
+    )
+
+    pair_ckl_inst = np.asarray(
+        pairwise_ckl_sampled["instantaneous_score"],
+        dtype=np.float64,
+    )
+    pair_ckl_cum = np.asarray(
+        pairwise_ckl_sampled["cumulative_score"],
+        dtype=np.float64,
+    )
+
+    pairwise_exact_ckl = exact_pairwise_scores_by_class(
+        ckl_raw,
+        labels,
+        start_index=common_start_col,
+    )
+
+    pair_exact_ckl_inst = np.asarray(
+        pairwise_exact_ckl["instantaneous_score"],
+        dtype=np.float64,
+    )
+    pair_exact_ckl_cum = np.asarray(
+        pairwise_exact_ckl["cumulative_score"],
+        dtype=np.float64,
+    )
+
     methods = {
         "CKL_z": z_ckl,
+        "CKL_pairwise_M10_instant": pair_ckl_inst,
+        "CKL_pairwise_M10_cumulative": pair_ckl_cum,
+        "CKL_pairwise_all_instant": pair_exact_ckl_inst,
+        "CKL_pairwise_all_cumulative": pair_exact_ckl_cum,
         "LE_GIE_direct_raw": le_gie,
         "LE_GIE_direct_z": z_le_gie,
-        "LE_GIE_pairwise_instant": pair_inst,
-        "LE_GIE_pairwise_cumulative": pair_cum,
+        "LE_GIE_pairwise_M10_instant": pair_inst,
+        "LE_GIE_pairwise_M10_cumulative": pair_cum,
+        "LE_GIE_pairwise_all_instant": pair_exact_le_inst,
+        "LE_GIE_pairwise_all_cumulative": pair_exact_le_cum,
     }
 
     auc_rows = summarize_auc(
@@ -814,6 +881,28 @@ def main():
         pairwise_rows,
     )
 
+    exact_le_rows = summarize_pairwise(
+        epochs,
+        pairwise_exact_le,
+        common_start_col,
+    )
+    write_csv(
+        args.output_dir
+        / "pairwise_all_le_coverage_by_epoch.csv",
+        exact_le_rows,
+    )
+
+    exact_ckl_rows = summarize_pairwise(
+        epochs,
+        pairwise_exact_ckl,
+        common_start_col,
+    )
+    write_csv(
+        args.output_dir
+        / "pairwise_all_ckl_coverage_by_epoch.csv",
+        exact_ckl_rows,
+    )
+
     np.savez_compressed(
         args.output_dir
         / "comparison_score_trajectories.npz",
@@ -838,6 +927,16 @@ def main():
             pairwise["cumulative_comparisons"],
             dtype=np.int32,
         ),
+        le_pairwise_all_instantaneous=pair_exact_le_inst.astype(np.float32),
+        le_pairwise_all_cumulative=pair_exact_le_cum.astype(np.float32),
+        le_pairwise_all_valid_comparisons=np.asarray(
+            pairwise_exact_le["valid_comparisons"],
+            dtype=np.int32,
+        ),
+        ckl_pairwise_M10_instantaneous=pair_ckl_inst.astype(np.float32),
+        ckl_pairwise_M10_cumulative=pair_ckl_cum.astype(np.float32),
+        ckl_pairwise_all_instantaneous=pair_exact_ckl_inst.astype(np.float32),
+        ckl_pairwise_all_cumulative=pair_exact_ckl_cum.astype(np.float32),
         K=np.asarray(args.K, dtype=np.int64),
         n_peers=np.asarray(
             args.n_peers,
@@ -900,6 +999,12 @@ def main():
             "higher signed LE-GIE wins; tie contributes 0.5",
         "pairwise_accumulation":
             "cumulative wins / cumulative valid comparisons",
+        "exact_all_peer_rule":
+            "compare each sample with every finite same-observed-class peer; ties contribute 0.5",
+        "exact_all_peer_implementation":
+            "within-class sorting/rank computation; no NxN pair matrix",
+        "ckl_pairwise_included":
+            True,
         "common_start_col_zero_based":
             int(common_start_col),
         "common_start_epoch_one_based":

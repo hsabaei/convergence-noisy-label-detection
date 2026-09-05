@@ -517,3 +517,177 @@ def pairwise_scores_by_class(
         "start_index": int(start_index),
         "seed": int(seed),
     }
+
+
+def exact_pairwise_scores_by_class(
+    score_nt: np.ndarray,
+    labels: np.ndarray,
+    *,
+    start_index: int = 0,
+):
+    """Exact all-peer same-class pairwise scores over time.
+
+    For sample i at epoch t, compare its score with every other *finite*
+    sample sharing the same observed label.
+
+    A win is score_i > score_j and a tie contributes 0.5, matching
+    ``pairwise_scores_by_class``.
+
+    The instantaneous score is
+
+        P_i(t) =
+            [# lower peers + 0.5 * # tied peers]
+            / [# valid same-class peers].
+
+    This is the exact within-class pairwise percentile/rank.  No random
+    peer sampling is used.
+
+    The cumulative score is kept exactly analogous to the sampled version:
+
+        C_i(t) =
+            cumulative pairwise win mass
+            / cumulative valid all-peer comparisons.
+
+    Parameters
+    ----------
+    score_nt:
+        Score array in [N,T] orientation. Larger means more noisy-like.
+    labels:
+        Observed labels, shape [N].
+    start_index:
+        Zero-based epoch column where monitoring begins.
+
+    Returns
+    -------
+    dict containing:
+        instantaneous_score [N,T]
+        cumulative_score [N,T]
+        valid_comparisons [N,T]
+        cumulative_comparisons [N,T]
+        cumulative_wins [N,T]
+        start_index
+        peer_mode = "all_same_class"
+    """
+    score = np.asarray(score_nt, dtype=np.float64)
+    labels = np.asarray(labels)
+
+    if score.ndim != 2:
+        raise ValueError(
+            f"score_nt must have shape [N,T], got {score.shape}."
+        )
+
+    N, T = score.shape
+
+    if labels.shape != (N,):
+        raise ValueError(
+            f"labels must have shape ({N},), got {labels.shape}."
+        )
+
+    start_index = int(start_index)
+    if start_index < 0 or start_index >= T:
+        raise ValueError(
+            f"start_index must be in [0, {T - 1}], got {start_index}."
+        )
+
+    instantaneous = np.full((N, T), np.nan, dtype=np.float64)
+    cumulative = np.full((N, T), np.nan, dtype=np.float64)
+
+    # CIFAR-10 class sizes are ~5000, so int32 is ample.
+    valid_comparisons = np.zeros((N, T), dtype=np.int32)
+    cumulative_comparisons = np.zeros((N, T), dtype=np.int64)
+    cumulative_wins = np.zeros((N, T), dtype=np.float64)
+
+    running_wins = np.zeros(N, dtype=np.float64)
+    running_count = np.zeros(N, dtype=np.int64)
+
+    classes = np.unique(labels)
+    class_members = {
+        c: np.flatnonzero(labels == c)
+        for c in classes
+    }
+
+    for t in range(start_index, T):
+
+        wins_t = np.zeros(N, dtype=np.float64)
+        count_t = np.zeros(N, dtype=np.int32)
+
+        for c in classes:
+            members = class_members[c]
+            vals = score[members, t]
+
+            finite_local = np.flatnonzero(np.isfinite(vals))
+            n_valid = int(finite_local.size)
+
+            # Need at least one other valid peer.
+            if n_valid <= 1:
+                continue
+
+            finite_members = members[finite_local]
+            finite_vals = vals[finite_local]
+
+            # Stable sort; each tie group gets the same exact pairwise
+            # win fraction. We do not construct an Nc x Nc matrix.
+            order = np.argsort(finite_vals, kind="mergesort")
+            sorted_vals = finite_vals[order]
+            sorted_members = finite_members[order]
+
+            # Identify tie groups.
+            group_start = 0
+            while group_start < n_valid:
+                group_end = group_start + 1
+                v = sorted_vals[group_start]
+
+                while (
+                    group_end < n_valid
+                    and sorted_vals[group_end] == v
+                ):
+                    group_end += 1
+
+                group_size = group_end - group_start
+
+                # Every member in this tie group beats all lower-valued
+                # peers and receives half credit against tied peers other
+                # than itself.
+                lower_count = group_start
+                tied_other = group_size - 1
+
+                win_mass = (
+                    float(lower_count)
+                    + 0.5 * float(tied_other)
+                )
+                denom = n_valid - 1
+
+                group_members = sorted_members[group_start:group_end]
+
+                wins_t[group_members] = win_mass
+                count_t[group_members] = denom
+                instantaneous[group_members, t] = (
+                    win_mass / float(denom)
+                )
+
+                group_start = group_end
+
+        usable = count_t > 0
+
+        running_wins += wins_t
+        running_count += count_t.astype(np.int64)
+
+        valid_comparisons[:, t] = count_t
+        cumulative_wins[:, t] = running_wins
+        cumulative_comparisons[:, t] = running_count
+
+        cumulative_usable = running_count > 0
+        cumulative[cumulative_usable, t] = (
+            running_wins[cumulative_usable]
+            / running_count[cumulative_usable]
+        )
+
+    return {
+        "instantaneous_score": instantaneous,
+        "cumulative_score": cumulative,
+        "valid_comparisons": valid_comparisons,
+        "cumulative_comparisons": cumulative_comparisons,
+        "cumulative_wins": cumulative_wins,
+        "start_index": int(start_index),
+        "peer_mode": "all_same_class",
+    }
