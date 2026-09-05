@@ -35,6 +35,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from convergence_monitoring.detectors import binary_auc_from_scores
 from convergence_monitoring.framework import standardize_monitoring_score
+from convergence_monitoring.proposed_le import rolling_proposed_le_batch
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,10 +55,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=REPO_ROOT / "results" / "proposed_le_scores",
     )
-    parser.add_argument("--K", type=int, default=15, help="Proposed-LE window length.")
+    parser.add_argument("--K", type=int, default=20, help="Proposed-LE window length.")
     parser.add_argument(
         "--limit-method",
-        choices=("next", "aitken"),
+        choices=("next", "aitken", "aitken_guarded"),
         default="next",
         help="Practical limit estimate used by the proposed estimator.",
     )
@@ -69,148 +70,6 @@ def parse_args() -> argparse.Namespace:
     if args.num_classes < 2:
         parser.error("--num-classes must be at least 2.")
     return args
-
-
-def rowwise_hill(V: np.ndarray) -> np.ndarray:
-    """Vectorized row-wise equivalent of proposed_le._hill_estimator_float."""
-    V = np.asarray(V, dtype=np.float64)
-    if V.ndim != 2:
-        raise ValueError("V must be two-dimensional.")
-
-    valid = np.isfinite(V) & (V > 0.0)
-    k = valid.sum(axis=1).astype(np.float64)
-
-    masked = np.where(valid, V, -np.inf)
-    w = np.max(masked, axis=1)
-
-    out = np.full(V.shape[0], np.nan, dtype=np.float64)
-    base_ok = (k >= 2.0) & np.isfinite(w) & (w > 0.0)
-    if not np.any(base_ok):
-        return out
-
-    safe_w = np.where(base_ok, w, 1.0)
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        logs = np.where(valid, np.log(V / safe_w[:, None]), 0.0)
-    denominator = np.sum(logs, axis=1)
-
-    ok = base_ok & np.isfinite(denominator) & (denominator != 0.0)
-    hill = np.full(V.shape[0], np.nan, dtype=np.float64)
-    hill[ok] = -k[ok] / denominator[ok]
-
-    good = ok & np.isfinite(hill) & (hill > 0.0)
-    out[good] = hill[good]
-    return out
-
-
-def estimate_proposed_le_all_samples(
-    loss_traj: np.ndarray,
-    *,
-    K: int,
-    limit_method: str,
-) -> dict[str, np.ndarray | int]:
-    """Vectorized rolling proposed LE for loss_traj with shape [N, T]."""
-    x = np.asarray(loss_traj, dtype=np.float64)
-    if x.ndim != 2:
-        raise ValueError(f"loss_traj must have shape [N,T], got {x.shape}.")
-
-    N, T = x.shape
-    if T < K + 2:
-        raise ValueError(f"Need at least K+2={K+2} epochs; found T={T}.")
-
-    lambda_traj = np.full((N, T), np.nan, dtype=np.float64)
-    ell_err_traj = np.full((N, T), np.nan, dtype=np.float64)
-    id_fie_traj = np.full((N, T), np.nan, dtype=np.float64)
-    limit_traj = np.full((N, T), np.nan, dtype=np.float64)
-    valid_traj = np.zeros((N, T), dtype=bool)
-
-    inv_j = 1.0 / np.arange(1, K + 1, dtype=np.float64)
-
-    # Observation column t contains x[n+1], with n=t-1.
-    for t in range(K + 1, T):
-        n = t - 1
-        t0 = n - K
-
-        if limit_method == "next":
-            L_hat = x[:, t].copy()
-        elif limit_method == "aitken":
-            denominator = x[:, t] - 2.0 * x[:, t - 1] + x[:, t - 2]
-            L_hat = np.full(N, np.nan, dtype=np.float64)
-            ok_denom = np.isfinite(denominator) & (denominator != 0.0)
-            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                L_hat[ok_denom] = (
-                    x[ok_denom, t - 2]
-                    - (x[ok_denom, t - 1] - x[ok_denom, t - 2]) ** 2
-                    / denominator[ok_denom]
-                )
-        else:
-            raise ValueError("limit_method must be 'next' or 'aitken'.")
-
-        limit_traj[:, t] = L_hat
-
-        # Error component in proposed_le.py.
-        r0 = np.abs(x[:, t0] - L_hat)
-        rj = np.abs(x[:, t0 + 1 : t] - L_hat[:, None])  # j=1,...,K
-
-        valid_ell = (
-            np.isfinite(L_hat)
-            & np.isfinite(r0)
-            & (r0 != 0.0)
-            & np.all(np.isfinite(rj) & (rj != 0.0), axis=1)
-        )
-
-        ell_err = np.full(N, np.nan, dtype=np.float64)
-        if np.any(valid_ell):
-            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                ell_values = (
-                    np.log(rj[valid_ell] / r0[valid_ell, None])
-                    * inv_j[None, :]
-                )
-            ell_err[valid_ell] = np.mean(ell_values, axis=1)
-
-        # FIE component.  Slices exactly match proposed_le.py:
-        #   R  = x[t0:n]     - L_hat
-        #   FR = x[t0+1:n+1] - L_hat
-        R = np.abs(x[:, t0:n] - L_hat[:, None])
-        FR = np.abs(x[:, t0 + 1 : n + 1] - L_hat[:, None])
-
-        hill_R = rowwise_hill(R)
-        hill_FR = rowwise_hill(FR)
-
-        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            id_fie = hill_R / hill_FR
-            lambda_hat = ell_err + np.log(id_fie)
-
-        valid = (
-            valid_ell
-            & np.isfinite(hill_R)
-            & np.isfinite(hill_FR)
-            & np.isfinite(id_fie)
-            & (id_fie > 0.0)
-            & np.isfinite(lambda_hat)
-        )
-
-        ell_err_traj[valid, t] = ell_err[valid]
-        id_fie_traj[valid, t] = id_fie[valid]
-        lambda_traj[valid, t] = lambda_hat[valid]
-        valid_traj[valid, t] = True
-
-        epoch = t + 1
-        if epoch == K + 2 or epoch % 10 == 0 or epoch == T:
-            print(
-                f"epoch={epoch:03d}/{T} "
-                f"valid={int(valid.sum())}/{N} "
-                f"({100.0 * valid.mean():.2f}%)"
-            )
-
-    return {
-        "lambda_traj": lambda_traj,
-        "ell_err_traj": ell_err_traj,
-        "id_fie_traj": id_fie_traj,
-        "limit_traj": limit_traj,
-        "valid_traj": valid_traj,
-        "first_available_column": K + 1,
-        "first_available_epoch": K + 2,
-    }
 
 
 def auc_by_epoch(
@@ -329,7 +188,7 @@ def main() -> None:
     print(f"limit_method: {args.limit_method}")
     print(f"n_noisy: {int(is_anomaly.sum())}")
 
-    le = estimate_proposed_le_all_samples(
+    le = rolling_proposed_le_batch(
         loss_traj,
         K=args.K,
         limit_method=args.limit_method,
@@ -371,6 +230,7 @@ def main() -> None:
         id_fie_traj=np.asarray(le["id_fie_traj"], dtype=np.float32),
         limit_traj=np.asarray(le["limit_traj"], dtype=np.float32),
         valid_traj=valid_traj,
+        aitken_fallback_traj=np.asarray(le["aitken_fallback_traj"], dtype=bool),
         z_higher_is_noisy=z_higher_tn.T.astype(np.float32),
         z_lower_is_noisy=z_lower_tn.T.astype(np.float32),
         auc_higher_is_noisy=auc_higher,
@@ -400,7 +260,9 @@ def main() -> None:
         "input_npz": str(input_path),
         "K": int(args.K),
         "limit_method": args.limit_method,
-        "numeric_backend": "float64-vectorized-equivalent",
+        "numeric_backend": "float64-batch-from-src",
+        "estimator_implementation": "convergence_monitoring.proposed_le.rolling_proposed_le_batch",
+        "relative_component": "log(abs(ID_FIE_hat))",
         "trajectory_orientation": "arrays are [sample_index, epoch_index] = [N,T]",
         "first_available_column_zero_based": first_col,
         "first_available_epoch_one_based": first_epoch,

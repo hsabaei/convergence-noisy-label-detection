@@ -196,33 +196,42 @@ def _proposed_float(
             x[n + 1]
         )
 
-    elif limit_method == "aitken":
+    elif limit_method in ("aitken", "aitken_guarded"):
 
-        denominator = (
-            x[n + 1]
-            - 2.0 * x[n]
-            + x[n - 1]
-        )
+        d0 = x[n] - x[n - 1]
+        d1 = x[n + 1] - x[n]
+        denominator = d1 - d0
 
-        if denominator == 0.0:
-            return failure(
-                "Aitken denominator is zero."
+        if limit_method == "aitken":
+            if denominator == 0.0:
+                return failure(
+                    "Aitken denominator is zero."
+                )
+            use_aitken = True
+        else:
+            # Scale-aware guard for a nearly-zero second difference.
+            scale = max(abs(d0), abs(d1), np.finfo(float).tiny)
+            tol = np.sqrt(np.finfo(float).eps) * scale
+            use_aitken = (
+                np.isfinite(denominator)
+                and abs(denominator) > tol
             )
 
-        L_hat = (
-            x[n - 1]
-            -
-            (
-                (x[n] - x[n - 1]) ** 2
-                / denominator
+        if use_aitken:
+            L_hat = (
+                x[n - 1]
+                - (d0 ** 2) / denominator
             )
-        )
+        else:
+            # Same information horizon as "next": x[n+1] is available.
+            L_hat = float(x[n + 1])
+            used_limit_method = "aitken_guarded_fallback_next"
 
     else:
 
         raise ValueError(
             "limit_method must be "
-            "'next' or 'aitken'."
+            "'next', 'aitken', or 'aitken_guarded'."
         )
 
     if not np.isfinite(L_hat):
@@ -316,10 +325,10 @@ def _proposed_float(
 
     if (
         not np.isfinite(id_fie_hat)
-        or id_fie_hat <= 0
+        or id_fie_hat == 0.0
     ):
         return failure(
-            "FIE estimate is invalid.",
+            "FIE estimate is zero or nonfinite.",
             ell_err_hat,
             id_fie_hat,
         )
@@ -328,9 +337,11 @@ def _proposed_float(
     # Final LE
     # ========================================================
 
+    # Theory requires the magnitude of the asymptotic LID contribution:
+    #     ell_rel = log |ID_F^*|
     lambda_hat = (
         ell_err_hat
-        + np.log(id_fie_hat)
+        + np.log(abs(id_fie_hat))
     )
 
     return {
@@ -467,33 +478,40 @@ def _proposed_mp(
 
         L_hat = x[n + 1]
 
-    elif limit_method == "aitken":
+    elif limit_method in ("aitken", "aitken_guarded"):
 
-        denominator = (
-            x[n + 1]
-            - 2 * x[n]
-            + x[n - 1]
-        )
+        d0 = x[n] - x[n - 1]
+        d1 = x[n + 1] - x[n]
+        denominator = d1 - d0
 
-        if denominator == 0:
-            return failure(
-                "Aitken denominator is zero."
+        if limit_method == "aitken":
+            if denominator == 0:
+                return failure(
+                    "Aitken denominator is zero."
+                )
+            use_aitken = True
+        else:
+            scale = max(mp.fabs(d0), mp.fabs(d1), mp.mpf("1e-100"))
+            tol = mp.sqrt(mp.eps) * scale
+            use_aitken = (
+                mp.isfinite(denominator)
+                and mp.fabs(denominator) > tol
             )
 
-        L_hat = (
-            x[n - 1]
-            -
-            (
-                (x[n] - x[n - 1]) ** 2
-                / denominator
+        if use_aitken:
+            L_hat = (
+                x[n - 1]
+                - (d0 ** 2) / denominator
             )
-        )
+        else:
+            L_hat = x[n + 1]
+            used_limit_method = "aitken_guarded_fallback_next"
 
     else:
 
         raise ValueError(
             "limit_method must be "
-            "'next' or 'aitken'."
+            "'next', 'aitken', or 'aitken_guarded'."
         )
 
     if not mp.isfinite(L_hat):
@@ -611,10 +629,10 @@ def _proposed_mp(
 
     if (
         not mp.isfinite(id_fie_hat)
-        or id_fie_hat <= 0
+        or id_fie_hat == 0
     ):
         return failure(
-            "FIE estimate is invalid.",
+            "FIE estimate is zero or nonfinite.",
             ell_err_hat,
             id_fie_hat,
         )
@@ -623,9 +641,11 @@ def _proposed_mp(
     # Final Lyapunov estimate
     # ========================================================
 
+    # Theory requires the magnitude of the asymptotic LID contribution:
+    #     ell_rel = log |ID_F^*|
     lambda_hat = (
         ell_err_hat
-        + mp.log(id_fie_hat)
+        + mp.log(mp.fabs(id_fie_hat))
     )
 
     if not mp.isfinite(lambda_hat):
@@ -789,3 +809,326 @@ def rolling_proposed_le_estimator(
         )
 
     return results
+
+
+# ============================================================
+# Vectorized rolling estimator for many trajectories
+# ============================================================
+
+def _rowwise_hill_float(V):
+    """Row-wise Hill estimator for a 2-D float64 array."""
+    V = np.asarray(V, dtype=np.float64)
+
+    if V.ndim != 2:
+        raise ValueError("V must be two-dimensional.")
+
+    valid = np.isfinite(V) & (V > 0.0)
+    k = valid.sum(axis=1).astype(np.float64)
+
+    masked = np.where(valid, V, -np.inf)
+    w = np.max(masked, axis=1)
+
+    out = np.full(V.shape[0], np.nan, dtype=np.float64)
+
+    base_ok = (
+        (k >= 2.0)
+        & np.isfinite(w)
+        & (w > 0.0)
+    )
+
+    if not np.any(base_ok):
+        return out
+
+    safe_w = np.where(base_ok, w, 1.0)
+
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+    ):
+        logs = np.where(
+            valid,
+            np.log(V / safe_w[:, None]),
+            0.0,
+        )
+
+    denominator = np.sum(logs, axis=1)
+
+    ok = (
+        base_ok
+        & np.isfinite(denominator)
+        & (denominator != 0.0)
+    )
+
+    hill = np.full(V.shape[0], np.nan, dtype=np.float64)
+    hill[ok] = -k[ok] / denominator[ok]
+
+    good = (
+        ok
+        & np.isfinite(hill)
+        & (hill > 0.0)
+    )
+
+    out[good] = hill[good]
+    return out
+
+
+def rolling_proposed_le_batch(
+    x,
+    K,
+    limit_method="next",
+):
+    """Vectorized rolling proposed-LE estimator for many trajectories.
+
+    Parameters
+    ----------
+    x : array-like, shape (N, T)
+        N scalar trajectories observed over T epochs.
+    K : int
+        Estimation-window parameter used by ``proposed_le_estimator``.
+    limit_method : {"next", "aitken", "aitken_guarded"}
+        Practical fixed-point estimate.
+
+    Returns
+    -------
+    dict
+        Arrays use shape (N, T).  Observation column ``t`` contains the
+        estimate whose endpoint is ``n=t-1``; therefore the first available
+        one-based epoch is ``K+2``.
+
+    Notes
+    -----
+    This is the batched float64 implementation of the same estimator defined
+    in this module.  In particular,
+
+        lambda_hat = ell_err_hat + log(abs(id_fie_hat)).
+
+    ``aitken_guarded`` uses Aitken Delta^2 when its second difference is
+    numerically resolved, otherwise it falls back to the same ``x[n+1]``
+    limit used by ``limit_method="next"``.
+    """
+    x = np.asarray(x, dtype=np.float64)
+
+    if x.ndim != 2:
+        raise ValueError(
+            f"x must have shape (N,T); got {x.shape}."
+        )
+
+    if K < 1:
+        raise ValueError("K must be positive.")
+
+    if limit_method not in (
+        "next",
+        "aitken",
+        "aitken_guarded",
+    ):
+        raise ValueError(
+            "limit_method must be 'next', 'aitken', "
+            "or 'aitken_guarded'."
+        )
+
+    N, T = x.shape
+
+    if T < K + 2:
+        raise ValueError(
+            f"Need at least K+2={K+2} observations; found T={T}."
+        )
+
+    lambda_traj = np.full((N, T), np.nan, dtype=np.float64)
+    ell_err_traj = np.full((N, T), np.nan, dtype=np.float64)
+    id_fie_traj = np.full((N, T), np.nan, dtype=np.float64)
+    limit_traj = np.full((N, T), np.nan, dtype=np.float64)
+    valid_traj = np.zeros((N, T), dtype=bool)
+    aitken_fallback_traj = np.zeros((N, T), dtype=bool)
+
+    inv_j = (
+        1.0
+        / np.arange(
+            1,
+            K + 1,
+            dtype=np.float64,
+        )
+    )
+
+    # Column t is the latest observation x[n+1], hence n=t-1.
+    for t in range(K + 1, T):
+
+        n = t - 1
+        t0 = n - K
+
+        if limit_method == "next":
+
+            L_hat = x[:, t].copy()
+
+        else:
+
+            d0 = x[:, t - 1] - x[:, t - 2]
+            d1 = x[:, t] - x[:, t - 1]
+            denominator = d1 - d0
+
+            L_hat = np.full(
+                N,
+                np.nan,
+                dtype=np.float64,
+            )
+
+            if limit_method == "aitken":
+
+                use_aitken = (
+                    np.isfinite(denominator)
+                    & (denominator != 0.0)
+                )
+
+            else:
+
+                scale = np.maximum(
+                    np.maximum(
+                        np.abs(d0),
+                        np.abs(d1),
+                    ),
+                    np.finfo(np.float64).tiny,
+                )
+
+                tol = (
+                    np.sqrt(np.finfo(np.float64).eps)
+                    * scale
+                )
+
+                use_aitken = (
+                    np.isfinite(denominator)
+                    & (np.abs(denominator) > tol)
+                )
+
+            with np.errstate(
+                divide="ignore",
+                invalid="ignore",
+                over="ignore",
+            ):
+                L_hat[use_aitken] = (
+                    x[use_aitken, t - 2]
+                    - (
+                        d0[use_aitken] ** 2
+                        / denominator[use_aitken]
+                    )
+                )
+
+            if limit_method == "aitken_guarded":
+
+                fallback = (
+                    ~use_aitken
+                    | ~np.isfinite(L_hat)
+                )
+
+                L_hat[fallback] = x[fallback, t]
+                aitken_fallback_traj[fallback, t] = True
+
+        limit_traj[:, t] = L_hat
+
+        # ----------------------------------------------------
+        # Error-decay component
+        # ----------------------------------------------------
+
+        r0 = np.abs(
+            x[:, t0]
+            - L_hat
+        )
+
+        rj = np.abs(
+            x[:, t0 + 1:t]
+            - L_hat[:, None]
+        )
+
+        valid_ell = (
+            np.isfinite(L_hat)
+            & np.isfinite(r0)
+            & (r0 != 0.0)
+            & np.all(
+                np.isfinite(rj)
+                & (rj != 0.0),
+                axis=1,
+            )
+        )
+
+        ell_err = np.full(
+            N,
+            np.nan,
+            dtype=np.float64,
+        )
+
+        if np.any(valid_ell):
+
+            with np.errstate(
+                divide="ignore",
+                invalid="ignore",
+                over="ignore",
+            ):
+                ell_values = (
+                    np.log(
+                        rj[valid_ell]
+                        / r0[valid_ell, None]
+                    )
+                    * inv_j[None, :]
+                )
+
+            ell_err[valid_ell] = np.mean(
+                ell_values,
+                axis=1,
+            )
+
+        # ----------------------------------------------------
+        # FIE component
+        # ----------------------------------------------------
+
+        R = np.abs(
+            x[:, t0:n]
+            - L_hat[:, None]
+        )
+
+        FR = np.abs(
+            x[:, t0 + 1:n + 1]
+            - L_hat[:, None]
+        )
+
+        hill_R = _rowwise_hill_float(R)
+        hill_FR = _rowwise_hill_float(FR)
+
+        with np.errstate(
+            divide="ignore",
+            invalid="ignore",
+            over="ignore",
+        ):
+            id_fie = hill_R / hill_FR
+
+            # Corollary/theory:
+            #     ell_rel = log |ID_F^*|
+            lambda_hat = (
+                ell_err
+                + np.log(np.abs(id_fie))
+            )
+
+        valid = (
+            valid_ell
+            & np.isfinite(hill_R)
+            & np.isfinite(hill_FR)
+            & np.isfinite(id_fie)
+            & (id_fie != 0.0)
+            & np.isfinite(lambda_hat)
+        )
+
+        ell_err_traj[valid, t] = ell_err[valid]
+        id_fie_traj[valid, t] = id_fie[valid]
+        lambda_traj[valid, t] = lambda_hat[valid]
+        valid_traj[valid, t] = True
+
+    return {
+        "lambda_traj": lambda_traj,
+        "ell_err_traj": ell_err_traj,
+        "id_fie_traj": id_fie_traj,
+        "limit_traj": limit_traj,
+        "valid_traj": valid_traj,
+        "aitken_fallback_traj": aitken_fallback_traj,
+        "first_available_column": K + 1,
+        "first_available_epoch": K + 2,
+        "K": int(K),
+        "limit_method": limit_method,
+    }

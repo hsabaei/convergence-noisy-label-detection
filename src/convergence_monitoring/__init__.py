@@ -11,7 +11,11 @@ from .training import (
     set_seed,
 )
 from .estimators import EPS, LIDEstimators, ckl_finite
-from .proposed_le import proposed_le_estimator, rolling_proposed_le_estimator
+from .proposed_le import (
+    proposed_le_estimator,
+    rolling_proposed_le_estimator,
+    rolling_proposed_le_batch,
+)
 from .detectors import (
     binary_auc_from_scores,
     compute_minrun_m,
@@ -42,6 +46,7 @@ __all__ = [
     "ckl_finite",
     "proposed_le_estimator",
     "rolling_proposed_le_estimator",
+    "rolling_proposed_le_batch",
     "binary_auc_from_scores",
     "compute_minrun_m",
     "ewma_detector_same_tau",
