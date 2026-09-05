@@ -44,6 +44,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from convergence_monitoring.framework import standardize_monitoring_score
+
 
 # ---------------------------------------------------------------------
 # Utilities
@@ -160,6 +162,7 @@ def load_variant(path: Path, name: str):
 
     required = [
         "epoch",
+        "observed_label",
         "is_anomaly",
         "lambda_traj",
         "ell_err_traj",
@@ -175,6 +178,7 @@ def load_variant(path: Path, name: str):
     out = {
         "name": name,
         "epoch": np.asarray(d["epoch"], dtype=np.int64),
+        "observed_label": np.asarray(d["observed_label"], dtype=np.int64),
         "is_anomaly": np.asarray(d["is_anomaly"], dtype=bool),
         "lambda": np.asarray(d["lambda_traj"], dtype=np.float64),
         "ell_err": np.asarray(d["ell_err_traj"], dtype=np.float64),
@@ -203,6 +207,12 @@ def load_variant(path: Path, name: str):
         raise ValueError(
             f"{name}: epoch has shape {out['epoch'].shape}; expected {(T,)}"
         )
+    if out["observed_label"].shape != (N,):
+        raise ValueError(
+            f"{name}: observed_label has shape {out['observed_label'].shape}; "
+            f"expected {(N,)}"
+        )
+
     if out["is_anomaly"].shape != (N,):
         raise ValueError(
             f"{name}: is_anomaly has shape {out['is_anomaly'].shape}; "
@@ -392,6 +402,259 @@ def pairwise_summary(next_v, aitken_v):
     return rows
 
 
+
+# ---------------------------------------------------------------------
+# Weighted convergence-detection score
+# ---------------------------------------------------------------------
+
+WEIGHT_ALPHAS = (0.0, 0.25, 0.5, 1.0)
+
+
+def build_weighted_scores(v, num_classes=10):
+    """Build class-wise standardized weighted component scores.
+
+    The theoretical LE estimator remains unchanged:
+
+        lambda_hat = ell_err_hat + log(abs(ID_FIE_hat)).
+
+    For detection only, define
+
+        S_alpha = z(ell_err_hat) + alpha * z(log(abs(ID_FIE_hat))),
+
+    where each z-score is computed within observed class and epoch using the
+    project's shared standardization function.
+    """
+    labels = v["observed_label"]
+    K = None
+
+    # Infer the first usable column from the first epoch containing any finite LE.
+    finite_any = np.any(np.isfinite(v["lambda"]), axis=0)
+    usable_cols = np.flatnonzero(finite_any)
+    if usable_cols.size == 0:
+        raise ValueError(f"{v['name']}: no finite LE values found.")
+    first_col = int(usable_cols[0])
+
+    z_err_tn = standardize_monitoring_score(
+        v["ell_err"].T,
+        labels,
+        direction="higher",
+        num_classes=num_classes,
+        start_index=first_col,
+    )
+    z_id_tn = standardize_monitoring_score(
+        v["log_abs_id"].T,
+        labels,
+        direction="higher",
+        num_classes=num_classes,
+        start_index=first_col,
+    )
+
+    z_err = z_err_tn.T
+    z_id = z_id_tn.T
+
+    scores = {}
+    for alpha in WEIGHT_ALPHAS:
+        scores[float(alpha)] = z_err + float(alpha) * z_id
+
+    return {
+        "first_available_column": first_col,
+        "z_err": z_err,
+        "z_id": z_id,
+        "scores": scores,
+    }
+
+
+def summarize_weighted_scores(v, weighted):
+    rows = []
+    y = v["is_anomaly"]
+
+    for alpha, score in weighted["scores"].items():
+        for t_idx, ep in enumerate(v["epoch"]):
+            vals = score[:, t_idx]
+
+            auc_h, auc_l = auc_pair(y, vals)
+            med_clean, med_noisy, n_clean, n_noisy = median_by_group(
+                vals, y
+            )
+
+            rows.append({
+                "variant": v["name"],
+                "alpha": float(alpha),
+                "epoch": int(ep),
+                "auc_higher_is_noisy": auc_h,
+                "auc_lower_is_noisy": auc_l,
+                "median_clean": med_clean,
+                "median_noisy": med_noisy,
+                "median_noisy_minus_clean": (
+                    med_noisy - med_clean
+                    if np.isfinite(med_clean) and np.isfinite(med_noisy)
+                    else np.nan
+                ),
+                "n_finite_clean": n_clean,
+                "n_finite_noisy": n_noisy,
+            })
+
+    return rows
+
+
+def summarize_weighted_best(weighted_rows):
+    rows = []
+
+    keys = sorted(
+        set(
+            (r["variant"], float(r["alpha"]))
+            for r in weighted_rows
+        )
+    )
+
+    for variant, alpha in keys:
+        subset = [
+            r for r in weighted_rows
+            if r["variant"] == variant
+            and float(r["alpha"]) == alpha
+        ]
+
+        for direction_col, direction_name in (
+            ("auc_higher_is_noisy", "higher_is_noisy"),
+            ("auc_lower_is_noisy", "lower_is_noisy"),
+        ):
+            finite = [
+                r for r in subset
+                if np.isfinite(r[direction_col])
+            ]
+            if not finite:
+                continue
+
+            best = max(finite, key=lambda r: r[direction_col])
+
+            rows.append({
+                "variant": variant,
+                "alpha": alpha,
+                "direction": direction_name,
+                "best_auc": best[direction_col],
+                "best_epoch": best["epoch"],
+                "median_clean_at_best": best["median_clean"],
+                "median_noisy_at_best": best["median_noisy"],
+            })
+
+    return rows
+
+
+def summarize_weighted_fixed_windows(weighted_rows):
+    """Summaries over pre-specified early windows without optimizing an epoch."""
+    windows = (
+        (22, 30),
+        (22, 40),
+        (22, 60),
+    )
+
+    rows = []
+
+    keys = sorted(
+        set(
+            (r["variant"], float(r["alpha"]))
+            for r in weighted_rows
+        )
+    )
+
+    for variant, alpha in keys:
+        subset = [
+            r for r in weighted_rows
+            if r["variant"] == variant
+            and float(r["alpha"]) == alpha
+        ]
+
+        for start_ep, end_ep in windows:
+            rr = [
+                r for r in subset
+                if start_ep <= int(r["epoch"]) <= end_ep
+                and np.isfinite(r["auc_higher_is_noisy"])
+            ]
+
+            if not rr:
+                continue
+
+            aucs = np.asarray(
+                [r["auc_higher_is_noisy"] for r in rr],
+                dtype=np.float64,
+            )
+
+            rows.append({
+                "variant": variant,
+                "alpha": alpha,
+                "start_epoch": start_ep,
+                "end_epoch": end_ep,
+                "mean_auc_higher_is_noisy": float(np.mean(aucs)),
+                "median_auc_higher_is_noisy": float(np.median(aucs)),
+                "min_auc_higher_is_noisy": float(np.min(aucs)),
+                "max_auc_higher_is_noisy": float(np.max(aucs)),
+                "n_epochs": int(aucs.size),
+            })
+
+    return rows
+
+
+def plot_weighted_auc(weighted_rows, variant, out_path):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    for alpha in WEIGHT_ALPHAS:
+        rr = [
+            r for r in weighted_rows
+            if r["variant"] == variant
+            and float(r["alpha"]) == float(alpha)
+        ]
+
+        ax.plot(
+            [r["epoch"] for r in rr],
+            [r["auc_higher_is_noisy"] for r in rr],
+            label=f"alpha={alpha:g}",
+        )
+
+    ax.axhline(0.5, linewidth=1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ROC-AUC (higher weighted score = noisy)")
+    ax.set_title(
+        "Weighted convergence-detection score "
+        f"— {variant}"
+    )
+    ax.set_ylim(0.0, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_weighted_early_auc(weighted_rows, variant, out_path):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    for alpha in WEIGHT_ALPHAS:
+        rr = [
+            r for r in weighted_rows
+            if r["variant"] == variant
+            and float(r["alpha"]) == float(alpha)
+            and 22 <= int(r["epoch"]) <= 60
+        ]
+
+        ax.plot(
+            [r["epoch"] for r in rr],
+            [r["auc_higher_is_noisy"] for r in rr],
+            label=f"alpha={alpha:g}",
+        )
+
+    ax.axhline(0.5, linewidth=1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ROC-AUC (higher weighted score = noisy)")
+    ax.set_title(
+        "Weighted score AUC, early training "
+        f"— {variant}"
+    )
+    ax.set_ylim(0.4, 0.85)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------
@@ -575,6 +838,41 @@ def main():
         pairwise,
     )
 
+
+    # --------------------------------------------------------------
+    # Detection-score ablation:
+    # S_alpha = z(ell_err) + alpha * z(log|ID_FIE|)
+    #
+    # The LE estimator itself is NOT modified.
+    # --------------------------------------------------------------
+
+    next_weighted = build_weighted_scores(next_v)
+    aitken_weighted = build_weighted_scores(aitken_v)
+
+    weighted_rows = (
+        summarize_weighted_scores(next_v, next_weighted)
+        + summarize_weighted_scores(aitken_v, aitken_weighted)
+    )
+
+    write_csv(
+        args.output_dir / "weighted_score_epoch_summary.csv",
+        weighted_rows,
+    )
+
+    weighted_best = summarize_weighted_best(weighted_rows)
+    write_csv(
+        args.output_dir / "weighted_score_best_auc_summary.csv",
+        weighted_best,
+    )
+
+    weighted_windows = summarize_weighted_fixed_windows(
+        weighted_rows
+    )
+    write_csv(
+        args.output_dir / "weighted_score_early_window_summary.csv",
+        weighted_windows,
+    )
+
     validity_rows = []
     for v in (next_v, aitken_v):
         N, T = v["lambda"].shape
@@ -640,6 +938,28 @@ def main():
         args.output_dir / "fig_aitken_fallback_fraction.png",
     )
 
+
+    plot_weighted_auc(
+        weighted_rows,
+        "next",
+        args.output_dir / "fig_weighted_auc_next.png",
+    )
+    plot_weighted_auc(
+        weighted_rows,
+        "aitken_guarded",
+        args.output_dir / "fig_weighted_auc_aitken.png",
+    )
+    plot_weighted_early_auc(
+        weighted_rows,
+        "next",
+        args.output_dir / "fig_weighted_auc_early_next.png",
+    )
+    plot_weighted_early_auc(
+        weighted_rows,
+        "aitken_guarded",
+        args.output_dir / "fig_weighted_auc_early_aitken.png",
+    )
+
     print("========================================")
     print("LE component diagnostic complete")
     print("========================================")
@@ -652,6 +972,17 @@ def main():
             print(
                 f"{r['variant']:>16s} | "
                 f"{r['direction']:>16s} | "
+                f"best AUC={r['best_auc']:.6f} "
+                f"at epoch {r['best_epoch']}"
+            )
+
+    print()
+    print("Weighted detection-score results:")
+    for r in weighted_best:
+        if r["direction"] == "higher_is_noisy":
+            print(
+                f"{r['variant']:>16s} | "
+                f"alpha={r['alpha']:<4g} | "
                 f"best AUC={r['best_auc']:.6f} "
                 f"at epoch {r['best_epoch']}"
             )
