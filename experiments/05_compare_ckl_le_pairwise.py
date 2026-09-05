@@ -16,7 +16,7 @@ Pairwise LE-GIE:
 
 The pairwise detector intentionally stays simple:
     - same observed class peers
-    - M peers/sample/epoch
+    - M in {5,10,20,50,100} plus exact all-peers
     - no gamma/delta decomposition
     - no pairwise z-score
     - no Beta posterior
@@ -27,8 +27,8 @@ The script evaluates:
     1) CKL, class-wise standardized
     2) direct LE-GIE, raw
     3) direct LE-GIE, class-wise standardized
-    4) instantaneous pairwise LE-GIE win fraction
-    5) cumulative pairwise LE-GIE win fraction
+    4) sampled pairwise LE-GIE and CKL over an M sweep
+    5) exact all-peer pairwise LE-GIE and CKL
 
 All methods are evaluated on the same noisy-label ground truth.
 """
@@ -54,7 +54,7 @@ import matplotlib.pyplot as plt
 
 from convergence_monitoring.detectors import (
     binary_auc_from_scores,
-    pairwise_scores_by_class,
+    pairwise_scores_by_class_sweep,
     exact_pairwise_scores_by_class,
 )
 from convergence_monitoring.estimators import (
@@ -103,7 +103,16 @@ def parse_args():
     )
     p.add_argument("--K", type=int, default=20)
     p.add_argument("--num-classes", type=int, default=10)
-    p.add_argument("--n-peers", type=int, default=10)
+    p.add_argument(
+        "--peer-counts",
+        type=int,
+        nargs="+",
+        default=(5, 10, 20, 50, 100),
+        help=(
+            "Sampled same-class peer counts. A single nested peer draw is "
+            "used so smaller M values are prefixes of the largest-M draw."
+        ),
+    )
     p.add_argument("--pairwise-seed", type=int, default=66)
 
     p.add_argument(
@@ -125,8 +134,11 @@ def parse_args():
 
     if args.K < 6:
         p.error("--K must be at least 6.")
-    if args.n_peers < 1:
-        p.error("--n-peers must be positive.")
+    if not args.peer_counts:
+        p.error("--peer-counts must contain at least one value.")
+    if any(int(m) < 1 for m in args.peer_counts):
+        p.error("--peer-counts values must be positive.")
+    args.peer_counts = tuple(sorted(set(int(m) for m in args.peer_counts)))
     for q in args.top_fractions:
         if not 0.0 < q < 1.0:
             p.error("--top-fractions values must be in (0,1).")
@@ -425,6 +437,153 @@ def summarize_pairwise(
 
     return rows
 
+
+
+def summarize_m_sensitivity(
+    auc_rows,
+    topq_rows,
+    peer_counts,
+):
+    """Summarize cumulative pairwise performance for each M and all-peers."""
+    rows = []
+
+    for family, prefix in (
+        ("CKL", "CKL_pairwise_"),
+        ("LE_GIE", "LE_GIE_pairwise_"),
+    ):
+        m_labels = [str(int(m)) for m in peer_counts] + ["all"]
+
+        for m_label in m_labels:
+
+            method = (
+                f"{prefix}all_cumulative"
+                if m_label == "all"
+                else f"{prefix}M{m_label}_cumulative"
+            )
+
+            aa = [
+                r for r in auc_rows
+                if r["method"] == method
+                and np.isfinite(r["auc_higher_is_noisy"])
+            ]
+            if not aa:
+                continue
+
+            best = max(
+                aa,
+                key=lambda r: r["auc_higher_is_noisy"],
+            )
+
+            row = {
+                "family": family,
+                "M": m_label,
+                "best_auc": best["auc_higher_is_noisy"],
+                "best_auc_epoch": best["epoch"],
+                "finite_fraction_at_best_auc": best["finite_fraction"],
+            }
+
+            # Evaluate all requested operating points at the same
+            # best-AUC epoch for that M.
+            qq = [
+                r for r in topq_rows
+                if r["method"] == method
+                and int(r["epoch"]) == int(best["epoch"])
+            ]
+
+            for r in qq:
+                q_pct = int(round(100.0 * float(r["q"])))
+                row[f"top{q_pct}_TPR_at_best_auc_epoch"] = r["TPR"]
+                row[f"top{q_pct}_FPR_at_best_auc_epoch"] = r["FPR"]
+                row[f"top{q_pct}_precision_at_best_auc_epoch"] = r["precision"]
+                row[f"top{q_pct}_F1_at_best_auc_epoch"] = r["F1"]
+
+            rows.append(row)
+
+    return rows
+
+
+def plot_m_sensitivity_best_auc(
+    m_rows,
+    family,
+    path,
+):
+    rr = [
+        r for r in m_rows
+        if r["family"] == family
+    ]
+    if not rr:
+        return
+
+    # Keep numerical M in order, followed by all.
+    def key(r):
+        return (
+            10**9
+            if r["M"] == "all"
+            else int(r["M"])
+        )
+
+    rr = sorted(rr, key=key)
+
+    x = np.arange(len(rr))
+    y = [r["best_auc"] for r in rr]
+    labels = [r["M"] for r in rr]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(x, y, marker="o")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("Peers per sample per epoch (M)")
+    ax.set_ylabel("Best cumulative pairwise ROC-AUC")
+    ax.set_title(f"{family}: pairwise M sensitivity")
+    ax.set_ylim(0.5, 1.0)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def plot_cumulative_auc_by_m(
+    epochs,
+    y,
+    methods,
+    family,
+    peer_counts,
+    common_start_col,
+    path,
+):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    prefix = (
+        "CKL_pairwise_"
+        if family == "CKL"
+        else "LE_GIE_pairwise_"
+    )
+
+    labels_and_methods = [
+        (f"M={m}", f"{prefix}M{m}_cumulative")
+        for m in peer_counts
+    ]
+    labels_and_methods.append(
+        ("all peers", f"{prefix}all_cumulative")
+    )
+
+    for label, method in labels_and_methods:
+        score = methods[method]
+        auc = np.full(score.shape[1], np.nan, dtype=np.float64)
+
+        for t in range(common_start_col, score.shape[1]):
+            auc[t] = auc_from_labels(y, score[:, t])
+
+        ax.plot(epochs, auc, label=label)
+
+    ax.axhline(0.5, linewidth=1)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ROC-AUC")
+    ax.set_title(f"{family}: cumulative pairwise AUC by M")
+    ax.set_ylim(0.5, 1.0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
 
 def plot_auc(
     epochs,
@@ -744,34 +903,37 @@ def main():
     ).T
 
     # --------------------------------------------------------------
-    # Professor-motivated pairwise LE detector.
+    # Professor-motivated pairwise sensitivity sweep.
+    #
+    # M = 5,10,20,50,100 uses one nested peer draw per epoch/class,
+    # so the comparison isolates the effect of increasing M.
+    # "all" is the exact all-same-class reference.
     # --------------------------------------------------------------
 
-    pairwise = pairwise_scores_by_class(
+    le_sweep = pairwise_scores_by_class_sweep(
         le_gie,
         labels,
-        n_peers=args.n_peers,
+        peer_counts=args.peer_counts,
         start_index=common_start_col,
         seed=args.pairwise_seed,
     )
 
-    pair_inst = np.asarray(
-        pairwise["instantaneous_score"],
-        dtype=np.float64,
+    ckl_sweep = pairwise_scores_by_class_sweep(
+        ckl_raw,
+        labels,
+        peer_counts=args.peer_counts,
+        start_index=common_start_col,
+        seed=args.pairwise_seed,
     )
-    pair_cum = np.asarray(
-        pairwise["cumulative_score"],
-        dtype=np.float64,
-    )
-
-    # --------------------------------------------------------------
-    # Exact all-peer same-class pairwise LE-GIE.
-    # This removes Monte Carlo noise from M=10 sampling and gives the
-    # exact within-class pairwise percentile at each epoch.
-    # --------------------------------------------------------------
 
     pairwise_exact_le = exact_pairwise_scores_by_class(
         le_gie,
+        labels,
+        start_index=common_start_col,
+    )
+
+    pairwise_exact_ckl = exact_pairwise_scores_by_class(
+        ckl_raw,
         labels,
         start_index=common_start_col,
     )
@@ -785,36 +947,6 @@ def main():
         dtype=np.float64,
     )
 
-    # --------------------------------------------------------------
-    # Symmetric CKL pairwise comparisons.
-    #
-    # CKL raw and class-wise z(CKL) have the same within-class ordering
-    # at a fixed epoch, so raw CKL is sufficient for the pairwise rule.
-    # --------------------------------------------------------------
-
-    pairwise_ckl_sampled = pairwise_scores_by_class(
-        ckl_raw,
-        labels,
-        n_peers=args.n_peers,
-        start_index=common_start_col,
-        seed=args.pairwise_seed,
-    )
-
-    pair_ckl_inst = np.asarray(
-        pairwise_ckl_sampled["instantaneous_score"],
-        dtype=np.float64,
-    )
-    pair_ckl_cum = np.asarray(
-        pairwise_ckl_sampled["cumulative_score"],
-        dtype=np.float64,
-    )
-
-    pairwise_exact_ckl = exact_pairwise_scores_by_class(
-        ckl_raw,
-        labels,
-        start_index=common_start_col,
-    )
-
     pair_exact_ckl_inst = np.asarray(
         pairwise_exact_ckl["instantaneous_score"],
         dtype=np.float64,
@@ -826,17 +958,34 @@ def main():
 
     methods = {
         "CKL_z": z_ckl,
-        "CKL_pairwise_M10_instant": pair_ckl_inst,
-        "CKL_pairwise_M10_cumulative": pair_ckl_cum,
-        "CKL_pairwise_all_instant": pair_exact_ckl_inst,
-        "CKL_pairwise_all_cumulative": pair_exact_ckl_cum,
         "LE_GIE_direct_raw": le_gie,
         "LE_GIE_direct_z": z_le_gie,
-        "LE_GIE_pairwise_M10_instant": pair_inst,
-        "LE_GIE_pairwise_M10_cumulative": pair_cum,
-        "LE_GIE_pairwise_all_instant": pair_exact_le_inst,
-        "LE_GIE_pairwise_all_cumulative": pair_exact_le_cum,
     }
+
+    # Add sampled M values.
+    for m in args.peer_counts:
+        methods[f"CKL_pairwise_M{m}_instant"] = np.asarray(
+            ckl_sweep[m]["instantaneous_score"],
+            dtype=np.float64,
+        )
+        methods[f"CKL_pairwise_M{m}_cumulative"] = np.asarray(
+            ckl_sweep[m]["cumulative_score"],
+            dtype=np.float64,
+        )
+        methods[f"LE_GIE_pairwise_M{m}_instant"] = np.asarray(
+            le_sweep[m]["instantaneous_score"],
+            dtype=np.float64,
+        )
+        methods[f"LE_GIE_pairwise_M{m}_cumulative"] = np.asarray(
+            le_sweep[m]["cumulative_score"],
+            dtype=np.float64,
+        )
+
+    # Add exact all-peer reference.
+    methods["CKL_pairwise_all_instant"] = pair_exact_ckl_inst
+    methods["CKL_pairwise_all_cumulative"] = pair_exact_ckl_cum
+    methods["LE_GIE_pairwise_all_instant"] = pair_exact_le_inst
+    methods["LE_GIE_pairwise_all_cumulative"] = pair_exact_le_cum
 
     auc_rows = summarize_auc(
         epochs,
@@ -854,12 +1003,6 @@ def main():
     best_rows = summarize_best_auc(
         auc_rows
     )
-    pairwise_rows = summarize_pairwise(
-        epochs,
-        pairwise,
-        common_start_col,
-    )
-
     write_csv(
         args.output_dir
         / "auc_by_epoch.csv",
@@ -875,11 +1018,39 @@ def main():
         / "topq_metrics_by_epoch.csv",
         topq_rows,
     )
+
+    # M-sensitivity summary.
+    m_rows = summarize_m_sensitivity(
+        auc_rows,
+        topq_rows,
+        args.peer_counts,
+    )
     write_csv(
         args.output_dir
-        / "pairwise_coverage_by_epoch.csv",
-        pairwise_rows,
+        / "pairwise_m_sensitivity_summary.csv",
+        m_rows,
     )
+
+    # Coverage for every sampled M.
+    for m in args.peer_counts:
+        write_csv(
+            args.output_dir
+            / f"pairwise_le_M{m}_coverage_by_epoch.csv",
+            summarize_pairwise(
+                epochs,
+                le_sweep[m],
+                common_start_col,
+            ),
+        )
+        write_csv(
+            args.output_dir
+            / f"pairwise_ckl_M{m}_coverage_by_epoch.csv",
+            summarize_pairwise(
+                epochs,
+                ckl_sweep[m],
+                common_start_col,
+            ),
+        )
 
     exact_le_rows = summarize_pairwise(
         epochs,
@@ -903,57 +1074,47 @@ def main():
         exact_ckl_rows,
     )
 
+    # Compact score artifact: save cumulative sampled trajectories,
+    # exact all-peer trajectories, and direct scores. Instantaneous sampled
+    # trajectories are summarized in CSVs/plots but not duplicated here.
+    save_arrays = {
+        "sample_index": sample_index,
+        "epoch": epochs,
+        "observed_label": labels,
+        "true_label": true_label,
+        "is_anomaly": is_anomaly,
+        "ckl_raw": ckl_raw.astype(np.float32),
+        "z_ckl": z_ckl.astype(np.float32),
+        "ell_err": ell_err.astype(np.float32),
+        "id_gie": id_gie.astype(np.float32),
+        "le_gie": le_gie.astype(np.float32),
+        "z_le_gie": z_le_gie.astype(np.float32),
+        "le_pairwise_all_cumulative": pair_exact_le_cum.astype(np.float32),
+        "ckl_pairwise_all_cumulative": pair_exact_ckl_cum.astype(np.float32),
+        "K": np.asarray(args.K, dtype=np.int64),
+        "peer_counts": np.asarray(args.peer_counts, dtype=np.int64),
+        "pairwise_seed": np.asarray(args.pairwise_seed, dtype=np.int64),
+        "common_start_col": np.asarray(common_start_col, dtype=np.int64),
+        "common_start_epoch": np.asarray(common_start_epoch, dtype=np.int64),
+    }
+
+    for m in args.peer_counts:
+        save_arrays[
+            f"le_pairwise_M{m}_cumulative"
+        ] = np.asarray(
+            le_sweep[m]["cumulative_score"],
+            dtype=np.float32,
+        )
+        save_arrays[
+            f"ckl_pairwise_M{m}_cumulative"
+        ] = np.asarray(
+            ckl_sweep[m]["cumulative_score"],
+            dtype=np.float32,
+        )
+
     np.savez_compressed(
-        args.output_dir
-        / "comparison_score_trajectories.npz",
-        sample_index=sample_index,
-        epoch=epochs,
-        observed_label=labels,
-        true_label=true_label,
-        is_anomaly=is_anomaly,
-        ckl_raw=ckl_raw.astype(np.float32),
-        z_ckl=z_ckl.astype(np.float32),
-        ell_err=ell_err.astype(np.float32),
-        id_gie=id_gie.astype(np.float32),
-        le_gie=le_gie.astype(np.float32),
-        z_le_gie=z_le_gie.astype(np.float32),
-        pairwise_instantaneous=pair_inst.astype(np.float32),
-        pairwise_cumulative=pair_cum.astype(np.float32),
-        pairwise_valid_comparisons=np.asarray(
-            pairwise["valid_comparisons"],
-            dtype=np.int16,
-        ),
-        pairwise_cumulative_comparisons=np.asarray(
-            pairwise["cumulative_comparisons"],
-            dtype=np.int32,
-        ),
-        le_pairwise_all_instantaneous=pair_exact_le_inst.astype(np.float32),
-        le_pairwise_all_cumulative=pair_exact_le_cum.astype(np.float32),
-        le_pairwise_all_valid_comparisons=np.asarray(
-            pairwise_exact_le["valid_comparisons"],
-            dtype=np.int32,
-        ),
-        ckl_pairwise_M10_instantaneous=pair_ckl_inst.astype(np.float32),
-        ckl_pairwise_M10_cumulative=pair_ckl_cum.astype(np.float32),
-        ckl_pairwise_all_instantaneous=pair_exact_ckl_inst.astype(np.float32),
-        ckl_pairwise_all_cumulative=pair_exact_ckl_cum.astype(np.float32),
-        K=np.asarray(args.K, dtype=np.int64),
-        n_peers=np.asarray(
-            args.n_peers,
-            dtype=np.int64,
-        ),
-        pairwise_seed=np.asarray(
-            args.pairwise_seed,
-            dtype=np.int64,
-        ),
-        common_start_col=np.asarray(
-            common_start_col,
-            dtype=np.int64,
-        ),
-        common_start_epoch=np.asarray(
-            common_start_epoch,
-            dtype=np.int64,
-        ),
+        args.output_dir / "comparison_score_trajectories.npz",
+        **save_arrays,
     )
 
     plot_auc(
@@ -974,6 +1135,35 @@ def main():
         / "fig_top5_tpr_ckl_vs_le_pairwise.png",
     )
 
+    plot_m_sensitivity_best_auc(
+        m_rows,
+        "LE_GIE",
+        args.output_dir / "fig_le_pairwise_best_auc_vs_M.png",
+    )
+    plot_m_sensitivity_best_auc(
+        m_rows,
+        "CKL",
+        args.output_dir / "fig_ckl_pairwise_best_auc_vs_M.png",
+    )
+    plot_cumulative_auc_by_m(
+        epochs,
+        is_anomaly,
+        methods,
+        "LE_GIE",
+        args.peer_counts,
+        common_start_col,
+        args.output_dir / "fig_le_pairwise_cumulative_auc_by_M.png",
+    )
+    plot_cumulative_auc_by_m(
+        epochs,
+        is_anomaly,
+        methods,
+        "CKL",
+        args.peer_counts,
+        common_start_col,
+        args.output_dir / "fig_ckl_pairwise_cumulative_auc_by_M.png",
+    )
+
     metadata = {
         "artifact":
             "ckl_vs_le_gie_pairwise_comparison",
@@ -991,8 +1181,10 @@ def main():
             "mean loss trajectory of samples sharing observed label",
         "pairwise_peer_scope":
             "same observed class",
-        "pairwise_n_peers_per_sample_per_epoch":
-            int(args.n_peers),
+        "pairwise_peer_counts":
+            [int(m) for m in args.peer_counts],
+        "pairwise_sampling_design":
+            "nested peer sets: each smaller M is a prefix of one common maximum-M draw per class/epoch",
         "pairwise_seed":
             int(args.pairwise_seed),
         "pairwise_rule":
@@ -1040,8 +1232,9 @@ def main():
         f"{common_start_epoch}"
     )
     print(
-        f"Pairwise peers/sample/epoch: "
-        f"{args.n_peers}"
+        "Sampled peer counts: "
+        + ", ".join(str(m) for m in args.peer_counts)
+        + ", plus exact all-peers"
     )
     print()
 

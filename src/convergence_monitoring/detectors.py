@@ -691,3 +691,203 @@ def exact_pairwise_scores_by_class(
         "start_index": int(start_index),
         "peer_mode": "all_same_class",
     }
+
+
+def pairwise_scores_by_class_sweep(
+    score_nt: np.ndarray,
+    labels: np.ndarray,
+    *,
+    peer_counts=(5, 10, 20, 50, 100),
+    start_index: int = 0,
+    seed: int = 66,
+):
+    """Nested same-class pairwise sweep over several peer counts.
+
+    This is the controlled sensitivity version of ``pairwise_scores_by_class``.
+
+    For each epoch and observed class, one random class permutation and one
+    ordered set of ``max(peer_counts)`` distinct cyclic peer offsets are drawn.
+    Results for smaller M values use prefixes of that same peer set. Therefore
+    M=5,10,20,50,100 differ only by how many peers are included, not by an
+    unrelated random peer sample.
+
+    A pairwise win is score_i > score_j and a tie contributes 0.5.
+
+    Returns
+    -------
+    dict
+        Mapping integer M to the same output structure returned by
+        ``pairwise_scores_by_class``:
+            instantaneous_score
+            cumulative_score
+            valid_comparisons
+            cumulative_comparisons
+            cumulative_wins
+            n_peers
+            start_index
+            seed
+    """
+    score = np.asarray(score_nt, dtype=np.float64)
+    labels = np.asarray(labels)
+
+    if score.ndim != 2:
+        raise ValueError(
+            f"score_nt must have shape [N,T], got {score.shape}."
+        )
+
+    N, T = score.shape
+
+    if labels.shape != (N,):
+        raise ValueError(
+            f"labels must have shape ({N},), got {labels.shape}."
+        )
+
+    counts = sorted({int(m) for m in peer_counts})
+    if not counts or counts[0] < 1:
+        raise ValueError("peer_counts must contain positive integers.")
+
+    start_index = int(start_index)
+    if start_index < 0 or start_index >= T:
+        raise ValueError(
+            f"start_index must be in [0, {T - 1}], got {start_index}."
+        )
+
+    max_m = counts[-1]
+    classes = np.unique(labels)
+
+    class_members = {
+        c: np.flatnonzero(labels == c)
+        for c in classes
+    }
+
+    for c, members in class_members.items():
+        if members.size <= max_m:
+            raise ValueError(
+                f"Class {c} has {members.size} samples, but "
+                f"max(peer_counts)={max_m}; need class size > max M."
+            )
+
+    # Allocate one output bundle per M.
+    out = {}
+    running_wins = {}
+    running_count = {}
+
+    for m in counts:
+        out[m] = {
+            "instantaneous_score": np.full(
+                (N, T),
+                np.nan,
+                dtype=np.float64,
+            ),
+            "cumulative_score": np.full(
+                (N, T),
+                np.nan,
+                dtype=np.float64,
+            ),
+            "valid_comparisons": np.zeros(
+                (N, T),
+                dtype=np.int16,
+            ),
+            "cumulative_comparisons": np.zeros(
+                (N, T),
+                dtype=np.int32,
+            ),
+            "cumulative_wins": np.zeros(
+                (N, T),
+                dtype=np.float64,
+            ),
+            "n_peers": int(m),
+            "start_index": int(start_index),
+            "seed": int(seed),
+        }
+        running_wins[m] = np.zeros(N, dtype=np.float64)
+        running_count[m] = np.zeros(N, dtype=np.int32)
+
+    rng = np.random.default_rng(int(seed))
+
+    for t in range(start_index, T):
+
+        wins_epoch = {
+            m: np.zeros(N, dtype=np.float64)
+            for m in counts
+        }
+        count_epoch = {
+            m: np.zeros(N, dtype=np.int16)
+            for m in counts
+        }
+
+        for c in classes:
+
+            members = class_members[c]
+            nc = members.size
+
+            perm = rng.permutation(members)
+
+            # One common ordered peer-offset set for every M.
+            offsets = rng.choice(
+                np.arange(1, nc, dtype=np.int64),
+                size=max_m,
+                replace=False,
+            )
+
+            x_i = score[perm, t]
+
+            wins_prefix = np.zeros(nc, dtype=np.float64)
+            count_prefix = np.zeros(nc, dtype=np.int16)
+
+            snapshot_set = set(counts)
+
+            for k, offset in enumerate(offsets, start=1):
+
+                peers = np.roll(perm, int(offset))
+                x_j = score[peers, t]
+
+                valid = (
+                    np.isfinite(x_i)
+                    & np.isfinite(x_j)
+                )
+
+                if np.any(valid):
+                    win_mass = np.zeros(nc, dtype=np.float64)
+
+                    vi = x_i[valid]
+                    vj = x_j[valid]
+
+                    win_mass[valid] = np.where(
+                        vi > vj,
+                        1.0,
+                        np.where(vi == vj, 0.5, 0.0),
+                    )
+
+                    wins_prefix += win_mass
+                    count_prefix += valid.astype(np.int16)
+
+                if k in snapshot_set:
+                    wins_epoch[k][perm] = wins_prefix
+                    count_epoch[k][perm] = count_prefix
+
+        # Update cumulative evidence independently for every M.
+        for m in counts:
+
+            wins_t = wins_epoch[m]
+            count_t = count_epoch[m]
+
+            usable = count_t > 0
+            out[m]["instantaneous_score"][usable, t] = (
+                wins_t[usable] / count_t[usable]
+            )
+
+            running_wins[m] += wins_t
+            running_count[m] += count_t.astype(np.int32)
+
+            out[m]["valid_comparisons"][:, t] = count_t
+            out[m]["cumulative_wins"][:, t] = running_wins[m]
+            out[m]["cumulative_comparisons"][:, t] = running_count[m]
+
+            cum_usable = running_count[m] > 0
+            out[m]["cumulative_score"][cum_usable, t] = (
+                running_wins[m][cum_usable]
+                / running_count[m][cum_usable]
+            )
+
+    return out
