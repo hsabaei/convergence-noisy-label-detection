@@ -1,7 +1,10 @@
 """
-Small regression check for the corrected experiment logic.
+Small regression check for the corrected common-limit LE experiment.
 
-This test is intentionally standalone and does not require pytest.
+This test is standalone and does not require pytest.
+Run from anywhere inside the repository with:
+
+    python tests/test_common_limit_consistency.py
 """
 
 import importlib.util
@@ -9,10 +12,15 @@ from pathlib import Path
 import numpy as np
 
 
-EXPERIMENT = (
-    Path(__file__).resolve().parent
-    / "07_test_le_improvements.py"
-)
+# tests/test_common_limit_consistency.py
+# -> repository root is parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENT = REPO_ROOT / "experiments" / "07_test_le_improvements.py"
+
+if not EXPERIMENT.exists():
+    raise FileNotFoundError(
+        f"Could not find corrected experiment at: {EXPERIMENT}"
+    )
 
 spec = importlib.util.spec_from_file_location(
     "le_exp",
@@ -60,7 +68,7 @@ for method in (
 
     if method == "last3_mean":
         expected = np.mean(
-            x[:, t-2:t+1],
+            x[:, t - 2:t + 1],
             axis=1,
         )
         np.testing.assert_allclose(
@@ -74,8 +82,8 @@ for method in (
             x[:, t],
         )
 
-    # Verify the stored LE is composed from the ell_err and GIE
-    # produced under this SAME common-limit call.
+    # Verify that the stored LE is composed from ell_err and GIE
+    # produced under the same common-limit call.
     ell = out["ell_err_traj"][:, t]
     m = out["id_gie_traj"][:, t]
     lam = out["lambda_traj"][:, t]
@@ -89,9 +97,7 @@ for method in (
 
     expected_lam = (
         ell[valid]
-        + np.log(
-            np.abs(m[valid])
-        )
+        + np.log(np.abs(m[valid]))
     )
 
     np.testing.assert_allclose(
