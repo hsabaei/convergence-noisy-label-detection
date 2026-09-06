@@ -218,11 +218,25 @@ def minrun_detector(I: np.ndarray, m: int):
 
 
 def chernoff_window_k(T: int, ell: int, alpha: float, delta: float):
+    """Chernoff-calibrated sliding-window threshold.
+
+    Returns the mathematical threshold without clipping it to ``ell``.
+    If k > ell, that hyperparameter combination cannot trigger because a
+    length-ell window contains at most ell exceedances.  Keeping k unchanged
+    preserves the stated false-alarm calibration instead of silently weakening
+    it.
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0,1).")
+    if not (0.0 < delta < 1.0):
+        raise ValueError("delta must be in (0,1).")
+    if ell < 1 or ell > T:
+        raise ValueError("ell must satisfy 1 <= ell <= T.")
+
     mu = ell * alpha
     L = math.log((T - ell + 1) / delta)
     k_real = mu + 0.5 * (L + math.sqrt(L * L + 8.0 * mu * L))
-    k = int(math.ceil(k_real))
-    k = max(1, min(k, ell))
+    k = max(1, int(math.ceil(k_real)))
     return k, mu, L
 
 
@@ -891,3 +905,65 @@ def pairwise_scores_by_class_sweep(
             )
 
     return out
+
+
+def cumulative_ever_detected(hit: np.ndarray) -> np.ndarray:
+    """Absorbing sequential decision: once detected, remain detected."""
+    hit = np.asarray(hit, dtype=bool)
+    if hit.ndim != 2:
+        raise ValueError("hit must have shape [T,N].")
+    return np.maximum.accumulate(hit, axis=0)
+
+
+def first_hit_from_boolean(hit: np.ndarray) -> np.ndarray:
+    """Zero-based first-hit index for each sample; -1 means never detected."""
+    hit = np.asarray(hit, dtype=bool)
+    if hit.ndim != 2:
+        raise ValueError("hit must have shape [T,N].")
+
+    N = hit.shape[1]
+    out = np.full(N, -1, dtype=np.int32)
+    any_hit = hit.any(axis=0)
+    if np.any(any_hit):
+        out[any_hit] = np.argmax(hit[:, any_hit], axis=0).astype(np.int32)
+    return out
+
+
+def align_sliding_window_outputs(
+    window_sum: np.ndarray,
+    hit: np.ndarray,
+    *,
+    T: int,
+    ell: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Align sliding-window outputs to the epoch at which each window ends."""
+    window_sum = np.asarray(window_sum)
+    hit = np.asarray(hit, dtype=bool)
+
+    if window_sum.shape != hit.shape:
+        raise ValueError("window_sum and hit must have matching shape.")
+
+    N = hit.shape[1]
+    stat_full = np.full((T, N), np.nan, dtype=np.float64)
+    hit_full = np.zeros((T, N), dtype=bool)
+
+    start = int(ell) - 1
+    stat_full[start:start + window_sum.shape[0]] = window_sum
+    hit_full[start:start + hit.shape[0]] = hit
+
+    return stat_full, hit_full
+
+
+def threshold_continuous_score(
+    score_tn: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Threshold a continuous [T,N] score as a sequential detector.
+
+    Returns local threshold hits, absorbing detections, and first-hit indices.
+    """
+    score_tn = np.asarray(score_tn, dtype=np.float64)
+    hit = np.isfinite(score_tn) & (score_tn >= float(threshold))
+    ever = cumulative_ever_detected(hit)
+    first = first_hit_from_boolean(hit)
+    return hit, ever, first
