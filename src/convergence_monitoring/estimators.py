@@ -1186,15 +1186,30 @@ def build_class_reference_trajectory(
     loss_traj: np.ndarray,
     observed_label: np.ndarray,
     num_classes: int = 10,
+    reference_method: str = "mean",
+    trim_fraction: float = 0.10,
 ) -> np.ndarray:
-    """Return class-mean loss trajectories in [N,T] orientation.
+    """Return observed-class reference loss trajectories in [N,T].
 
-    For sample i with observed label c, every epoch uses
+    Parameters
+    ----------
+    loss_traj:
+        Per-sample loss trajectories, shape [N,T].
+    observed_label:
+        Observed class labels, shape [N].
+    reference_method:
+        One of:
+            "mean"               -- ordinary class mean (original behavior)
+            "leave_one_out_mean" -- class mean excluding sample i
+            "median"             -- class median
+            "trimmed_mean"       -- symmetric trimmed class mean
+    trim_fraction:
+        Fraction removed from EACH tail for ``trimmed_mean``.
 
-        G_i(t) = mean_j loss_j(t),  over j with observed_label_j = c.
-
-    This matches the class-reference construction already used by the CKL
-    experiment.  The sample itself is included in the class mean.
+    Notes
+    -----
+    The default remains the original observed-class mean so existing code is
+    backward compatible.
     """
     x = np.asarray(loss_traj, dtype=np.float64)
     labels = np.asarray(observed_label, dtype=np.int64)
@@ -1210,25 +1225,146 @@ def build_class_reference_trajectory(
             f"observed_label must have shape ({N},), got {labels.shape}."
         )
 
+    method = str(reference_method).lower()
+    allowed = {
+        "mean",
+        "leave_one_out_mean",
+        "median",
+        "trimmed_mean",
+    }
+    if method not in allowed:
+        raise ValueError(
+            f"reference_method must be one of {sorted(allowed)}; got {reference_method!r}."
+        )
+
+    trim_fraction = float(trim_fraction)
+    if method == "trimmed_mean" and not (0.0 <= trim_fraction < 0.5):
+        raise ValueError("trim_fraction must lie in [0,0.5).")
+
     G = np.full((N, T), np.nan, dtype=np.float64)
 
     for c in range(int(num_classes)):
-        idx = labels == c
-        if not np.any(idx):
+        members = np.flatnonzero(labels == c)
+        if members.size == 0:
             continue
 
-        with np.errstate(invalid="ignore"):
-            mean_t = np.nanmean(x[idx], axis=0)
+        sub = x[members]
 
-        G[idx] = mean_t[None, :]
+        if method == "mean":
+            with np.errstate(invalid="ignore"):
+                ref_t = np.nanmean(sub, axis=0)
+            G[members] = ref_t[None, :]
+            continue
+
+        if method == "median":
+            with np.errstate(invalid="ignore"):
+                ref_t = np.nanmedian(sub, axis=0)
+            G[members] = ref_t[None, :]
+            continue
+
+        if method == "leave_one_out_mean":
+            finite = np.isfinite(sub)
+            sums = np.nansum(sub, axis=0)
+            counts = finite.sum(axis=0)
+
+            numer = (
+                sums[None, :]
+                - np.where(finite, sub, 0.0)
+            )
+            denom = (
+                counts[None, :]
+                - finite.astype(np.int64)
+            )
+
+            ref = np.full_like(sub, np.nan, dtype=np.float64)
+            np.divide(
+                numer,
+                denom,
+                out=ref,
+                where=(denom > 0),
+            )
+            G[members] = ref
+            continue
+
+        # Symmetric trimmed mean.  This is intentionally implemented per
+        # epoch so NaNs, if any, are handled correctly.
+        ref_t = np.full(T, np.nan, dtype=np.float64)
+        for t in range(T):
+            vals = sub[:, t]
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+
+            vals = np.sort(vals)
+            n_trim = int(np.floor(trim_fraction * vals.size))
+
+            if n_trim > 0 and 2 * n_trim < vals.size:
+                vals = vals[n_trim:vals.size - n_trim]
+
+            ref_t[t] = float(np.mean(vals))
+
+        G[members] = ref_t[None, :]
 
     return G
 
+
+def _guarded_aitken_limit_batch(
+    a: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+    fallback: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Row-wise guarded Aitken Delta^2 limit with explicit fallback."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    fallback = np.asarray(fallback, dtype=np.float64)
+
+    d0 = b - a
+    d1 = c - b
+    denominator = d1 - d0
+
+    scale = np.maximum(
+        np.maximum(np.abs(d0), np.abs(d1)),
+        np.finfo(np.float64).tiny,
+    )
+    tol = np.sqrt(np.finfo(np.float64).eps) * scale
+
+    use_aitken = (
+        np.isfinite(a)
+        & np.isfinite(b)
+        & np.isfinite(c)
+        & np.isfinite(denominator)
+        & (np.abs(denominator) > tol)
+    )
+
+    L = np.full_like(a, np.nan, dtype=np.float64)
+
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+    ):
+        L[use_aitken] = (
+            a[use_aitken]
+            - (d0[use_aitken] ** 2)
+            / denominator[use_aitken]
+        )
+
+    used_fallback = (
+        ~use_aitken
+        | ~np.isfinite(L)
+    )
+    L[used_fallback] = fallback[used_fallback]
+
+    return L, used_fallback
 
 def vectorized_gie_window(
     phi: np.ndarray,
     G: np.ndarray,
     eps: float = EPS,
+    phi_limit: Optional[np.ndarray] = None,
+    G_limit: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Vectorized row-wise version of ``LIDEstimators.compute_GIE_LID``.
 
@@ -1236,16 +1372,14 @@ def vectorized_gie_window(
     ----------
     phi, G:
         Matching arrays with shape [N,K].
+    phi_limit, G_limit:
+        Optional row-wise limits, shape [N].  If omitted, the original
+        last-three mean convention is used independently for phi and G.
 
     Returns
     -------
     d, W:
         GIE estimate and sample boundary for each row.
-
-    Notes
-    -----
-    The limit convention matches the existing CKL/GIE implementation:
-    the mean of the final three observations in the current window.
     """
     phi = np.asarray(phi, dtype=np.float64)
     G = np.asarray(G, dtype=np.float64)
@@ -1258,11 +1392,26 @@ def vectorized_gie_window(
     N, _ = phi.shape
     epsilon = float(EPS)
 
-    phi_limit = np.mean(phi[:, -3:], axis=1)
-    G_limit = np.mean(G[:, -3:], axis=1)
+    if phi_limit is None:
+        phi_limit_arr = np.mean(phi[:, -3:], axis=1)
+    else:
+        phi_limit_arr = np.asarray(phi_limit, dtype=np.float64)
+        if phi_limit_arr.shape != (N,):
+            raise ValueError(
+                f"phi_limit must have shape ({N},), got {phi_limit_arr.shape}."
+            )
 
-    R = np.abs(phi - phi_limit[:, None])
-    FR = np.abs(G - G_limit[:, None])
+    if G_limit is None:
+        G_limit_arr = np.mean(G[:, -3:], axis=1)
+    else:
+        G_limit_arr = np.asarray(G_limit, dtype=np.float64)
+        if G_limit_arr.shape != (N,):
+            raise ValueError(
+                f"G_limit must have shape ({N},), got {G_limit_arr.shape}."
+            )
+
+    R = np.abs(phi - phi_limit_arr[:, None])
+    FR = np.abs(G - G_limit_arr[:, None])
 
     with np.errstate(invalid="ignore"):
         w0 = np.max(R, axis=1)
@@ -1271,7 +1420,6 @@ def vectorized_gie_window(
     W = w0.copy()
     d = np.full(N, np.nan, dtype=np.float64)
 
-    # Paired filtering, matching compute_GIE_LID.
     mask = (
         (R > eps)
         & (FR > eps)
@@ -1293,16 +1441,8 @@ def vectorized_gie_window(
     if not np.any(base_ok):
         return d, W
 
-    safe_w0 = np.where(
-        base_ok,
-        w0 + epsilon,
-        1.0,
-    )
-    safe_w1 = np.where(
-        base_ok,
-        w1 + epsilon,
-        1.0,
-    )
+    safe_w0 = np.where(base_ok, w0 + epsilon, 1.0)
+    safe_w1 = np.where(base_ok, w1 + epsilon, 1.0)
 
     with np.errstate(
         divide="ignore",
@@ -1350,20 +1490,44 @@ def vectorized_gie_window(
     d[good] = hill_num[good] / hill_den[good]
     return d, W
 
-
 def rolling_class_reference_gie_batch(
     loss_traj: np.ndarray,
     observed_label: np.ndarray,
     K: int = 20,
     num_classes: int = 10,
+    reference_method: str = "mean",
+    trim_fraction: float = 0.10,
+    limit_method: str = "last3_mean",
 ) -> Dict[str, np.ndarray]:
     """Compute rolling class-reference GIE trajectories.
 
-    The sample trajectory is ``phi_i`` and the reference trajectory is the
-    mean loss trajectory of the sample's observed CIFAR-10 class.
+    The theoretical quantity is unchanged; this function exposes finite-sample
+    choices that can be tested explicitly.
 
-    This is a detection/diagnostic GIE quantity.  It is not substituted into
-    the theoretical LE definition by this function.
+    Parameters
+    ----------
+    reference_method:
+        "mean" (original), "leave_one_out_mean", "median", or "trimmed_mean".
+    trim_fraction:
+        Symmetric per-tail fraction for ``trimmed_mean``.
+    limit_method:
+        "last3_mean"
+            Original GIE implementation.  A length-K window ends at column t,
+            and each limit is the mean of the last three values in that window.
+
+        "next"
+            A length-K window ends at t-1 and the observed value at t is used
+            as the post-window limit estimate for both phi and G.
+
+        "aitken_guarded"
+            Same length-K window as ``next``.  The limit is a guarded Aitken
+            Delta^2 estimate from columns t-2,t-1,t, falling back to the value
+            at t when the second difference is numerically unresolved.
+
+    Notes
+    -----
+    The default settings reproduce the original class-mean / last-three-mean
+    GIE behavior.
     """
     x = np.asarray(loss_traj, dtype=np.float64)
     labels = np.asarray(observed_label, dtype=np.int64)
@@ -1390,56 +1554,136 @@ def rolling_class_reference_gie_batch(
             f"Need at least K={K} observations; found T={T}."
         )
 
+    limit_method = str(limit_method).lower()
+    allowed_limits = {
+        "last3_mean",
+        "next",
+        "aitken_guarded",
+    }
+    if limit_method not in allowed_limits:
+        raise ValueError(
+            f"limit_method must be one of {sorted(allowed_limits)}; got {limit_method!r}."
+        )
+
     G = build_class_reference_trajectory(
         x,
         labels,
         num_classes=int(num_classes),
+        reference_method=reference_method,
+        trim_fraction=float(trim_fraction),
     )
 
-    id_gie_traj = np.full(
-        (N, T),
-        np.nan,
-        dtype=np.float64,
-    )
-    W_gie_traj = np.full(
-        (N, T),
-        np.nan,
-        dtype=np.float64,
-    )
-    valid_traj = np.zeros(
-        (N, T),
-        dtype=bool,
-    )
+    id_gie_traj = np.full((N, T), np.nan, dtype=np.float64)
+    W_gie_traj = np.full((N, T), np.nan, dtype=np.float64)
+    valid_traj = np.zeros((N, T), dtype=bool)
+    phi_limit_traj = np.full((N, T), np.nan, dtype=np.float64)
+    G_limit_traj = np.full((N, T), np.nan, dtype=np.float64)
+    aitken_fallback_traj = np.zeros((N, T), dtype=bool)
 
-    first_col = K - 1
+    if limit_method == "last3_mean":
+        first_col = K - 1
 
-    for t in range(first_col, T):
-        start = t - K + 1
+        for t in range(first_col, T):
+            start = t - K + 1
 
-        phi_w = x[:, start:t + 1]
-        G_w = G[:, start:t + 1]
+            phi_w = x[:, start:t + 1]
+            G_w = G[:, start:t + 1]
 
-        d_t, W_t = vectorized_gie_window(
-            phi_w,
-            G_w,
-            eps=EPS,
+            phi_limit = np.mean(phi_w[:, -3:], axis=1)
+            G_limit = np.mean(G_w[:, -3:], axis=1)
+
+            d_t, W_t = vectorized_gie_window(
+                phi_w,
+                G_w,
+                eps=EPS,
+                phi_limit=phi_limit,
+                G_limit=G_limit,
+            )
+
+            phi_limit_traj[:, t] = phi_limit
+            G_limit_traj[:, t] = G_limit
+
+            valid = np.isfinite(d_t) & (d_t != 0.0)
+            id_gie_traj[valid, t] = d_t[valid]
+            W_gie_traj[np.isfinite(W_t), t] = W_t[np.isfinite(W_t)]
+            valid_traj[valid, t] = True
+
+    else:
+        # Column t is the latest observation / post-window limit information.
+        first_col = K
+
+        for t in range(first_col, T):
+            start = t - K
+
+            phi_w = x[:, start:t]
+            G_w = G[:, start:t]
+
+            if limit_method == "next":
+                phi_limit = x[:, t].copy()
+                G_limit = G[:, t].copy()
+                fallback = np.zeros(N, dtype=bool)
+
+            else:
+                phi_limit, fallback_phi = _guarded_aitken_limit_batch(
+                    x[:, t - 2],
+                    x[:, t - 1],
+                    x[:, t],
+                    fallback=x[:, t],
+                )
+                G_limit, fallback_G = _guarded_aitken_limit_batch(
+                    G[:, t - 2],
+                    G[:, t - 1],
+                    G[:, t],
+                    fallback=G[:, t],
+                )
+                fallback = fallback_phi | fallback_G
+
+            d_t, W_t = vectorized_gie_window(
+                phi_w,
+                G_w,
+                eps=EPS,
+                phi_limit=phi_limit,
+                G_limit=G_limit,
+            )
+
+            phi_limit_traj[:, t] = phi_limit
+            G_limit_traj[:, t] = G_limit
+            aitken_fallback_traj[fallback, t] = True
+
+            valid = np.isfinite(d_t) & (d_t != 0.0)
+            id_gie_traj[valid, t] = d_t[valid]
+            W_gie_traj[np.isfinite(W_t), t] = W_t[np.isfinite(W_t)]
+            valid_traj[valid, t] = True
+
+    # Preserve the exact legacy metadata string for the default path.
+    # This is intentionally backward-compatible with earlier experiments
+    # that may record or inspect result["reference"].
+    method_key = str(reference_method).lower()
+    if method_key == "mean":
+        ref_text = "observed-class mean loss trajectory"
+    elif method_key == "leave_one_out_mean":
+        ref_text = "leave-one-out observed-class mean loss trajectory"
+    elif method_key == "median":
+        ref_text = "observed-class median loss trajectory"
+    else:
+        ref_text = (
+            "observed-class trimmed-mean loss trajectory "
+            f"(trim_each_tail={float(trim_fraction):g})"
         )
-
-        valid = (
-            np.isfinite(d_t)
-            & (d_t != 0.0)
-        )
-
-        id_gie_traj[valid, t] = d_t[valid]
-        W_gie_traj[np.isfinite(W_t), t] = W_t[np.isfinite(W_t)]
-        valid_traj[valid, t] = True
 
     return {
         "id_gie_traj": id_gie_traj,
         "W_gie_traj": W_gie_traj,
         "valid_traj": valid_traj,
+        "phi_limit_traj": phi_limit_traj,
+        "G_limit_traj": G_limit_traj,
+        "aitken_fallback_traj": aitken_fallback_traj,
         "first_available_column": int(first_col),
         "first_available_epoch": int(first_col + 1),
         "K": int(K),
-        "reference": "observed-class mean loss trajectory",
+        "reference_method": str(reference_method),
+        "trim_fraction": float(trim_fraction),
+        "limit_method": str(limit_method),
+        "reference": ref_text,
     }
+

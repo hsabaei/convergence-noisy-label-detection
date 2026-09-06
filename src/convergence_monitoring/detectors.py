@@ -541,46 +541,15 @@ def exact_pairwise_scores_by_class(
 ):
     """Exact all-peer same-class pairwise scores over time.
 
-    For sample i at epoch t, compare its score with every other *finite*
-    sample sharing the same observed label.
-
-    A win is score_i > score_j and a tie contributes 0.5, matching
-    ``pairwise_scores_by_class``.
-
-    The instantaneous score is
+    For sample i at epoch t,
 
         P_i(t) =
             [# lower peers + 0.5 * # tied peers]
             / [# valid same-class peers].
 
-    This is the exact within-class pairwise percentile/rank.  No random
-    peer sampling is used.
-
-    The cumulative score is kept exactly analogous to the sampled version:
-
-        C_i(t) =
-            cumulative pairwise win mass
-            / cumulative valid all-peer comparisons.
-
-    Parameters
-    ----------
-    score_nt:
-        Score array in [N,T] orientation. Larger means more noisy-like.
-    labels:
-        Observed labels, shape [N].
-    start_index:
-        Zero-based epoch column where monitoring begins.
-
-    Returns
-    -------
-    dict containing:
-        instantaneous_score [N,T]
-        cumulative_score [N,T]
-        valid_comparisons [N,T]
-        cumulative_comparisons [N,T]
-        cumulative_wins [N,T]
-        start_index
-        peer_mode = "all_same_class"
+    This is exactly the within-class average rank rescaled to [0,1].
+    The implementation uses sorting and vectorized tie groups; it does not
+    construct an Nc x Nc pair matrix.
     """
     score = np.asarray(score_nt, dtype=np.float64)
     labels = np.asarray(labels)
@@ -591,7 +560,6 @@ def exact_pairwise_scores_by_class(
         )
 
     N, T = score.shape
-
     if labels.shape != (N,):
         raise ValueError(
             f"labels must have shape ({N},), got {labels.shape}."
@@ -606,7 +574,6 @@ def exact_pairwise_scores_by_class(
     instantaneous = np.full((N, T), np.nan, dtype=np.float64)
     cumulative = np.full((N, T), np.nan, dtype=np.float64)
 
-    # CIFAR-10 class sizes are ~5000, so int32 is ample.
     valid_comparisons = np.zeros((N, T), dtype=np.int32)
     cumulative_comparisons = np.zeros((N, T), dtype=np.int64)
     cumulative_wins = np.zeros((N, T), dtype=np.float64)
@@ -632,56 +599,41 @@ def exact_pairwise_scores_by_class(
             finite_local = np.flatnonzero(np.isfinite(vals))
             n_valid = int(finite_local.size)
 
-            # Need at least one other valid peer.
             if n_valid <= 1:
                 continue
 
             finite_members = members[finite_local]
             finite_vals = vals[finite_local]
 
-            # Stable sort; each tie group gets the same exact pairwise
-            # win fraction. We do not construct an Nc x Nc matrix.
             order = np.argsort(finite_vals, kind="mergesort")
             sorted_vals = finite_vals[order]
             sorted_members = finite_members[order]
 
-            # Identify tie groups.
-            group_start = 0
-            while group_start < n_valid:
-                group_end = group_start + 1
-                v = sorted_vals[group_start]
+            # Group equal values without a Python loop over samples.
+            new_group = np.empty(n_valid, dtype=bool)
+            new_group[0] = True
+            new_group[1:] = sorted_vals[1:] != sorted_vals[:-1]
 
-                while (
-                    group_end < n_valid
-                    and sorted_vals[group_end] == v
-                ):
-                    group_end += 1
+            group_id = np.cumsum(new_group) - 1
+            group_counts = np.bincount(group_id)
 
-                group_size = group_end - group_start
+            group_starts = np.empty(group_counts.size, dtype=np.int64)
+            group_starts[0] = 0
+            if group_counts.size > 1:
+                group_starts[1:] = np.cumsum(group_counts[:-1])
 
-                # Every member in this tie group beats all lower-valued
-                # peers and receives half credit against tied peers other
-                # than itself.
-                lower_count = group_start
-                tied_other = group_size - 1
+            lower = group_starts[group_id].astype(np.float64)
+            tied_other_half = 0.5 * (
+                group_counts[group_id].astype(np.float64) - 1.0
+            )
+            win_mass_sorted = lower + tied_other_half
 
-                win_mass = (
-                    float(lower_count)
-                    + 0.5 * float(tied_other)
-                )
-                denom = n_valid - 1
+            denom = n_valid - 1
+            score_sorted = win_mass_sorted / float(denom)
 
-                group_members = sorted_members[group_start:group_end]
-
-                wins_t[group_members] = win_mass
-                count_t[group_members] = denom
-                instantaneous[group_members, t] = (
-                    win_mass / float(denom)
-                )
-
-                group_start = group_end
-
-        usable = count_t > 0
+            wins_t[sorted_members] = win_mass_sorted
+            count_t[sorted_members] = denom
+            instantaneous[sorted_members, t] = score_sorted
 
         running_wins += wins_t
         running_count += count_t.astype(np.int64)
@@ -690,10 +642,10 @@ def exact_pairwise_scores_by_class(
         cumulative_wins[:, t] = running_wins
         cumulative_comparisons[:, t] = running_count
 
-        cumulative_usable = running_count > 0
-        cumulative[cumulative_usable, t] = (
-            running_wins[cumulative_usable]
-            / running_count[cumulative_usable]
+        usable = running_count > 0
+        cumulative[usable, t] = (
+            running_wins[usable]
+            / running_count[usable]
         )
 
     return {
