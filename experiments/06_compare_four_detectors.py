@@ -159,7 +159,10 @@ def parse_args():
         "--pairwise-thresholds",
         type=float,
         nargs="+",
-        default=(0.60, 0.70, 0.80, 0.85, 0.90, 0.95),
+        default=(
+            0.60, 0.70, 0.80, 0.85, 0.90,
+            0.925, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995,
+        ),
     )
 
     p.add_argument(
@@ -180,7 +183,7 @@ def parse_args():
         "--output-dir",
         type=Path,
         default=Path(
-            "results/four_detector_comparison"
+            "results/four_detector_comparison_corrected"
         ),
     )
 
@@ -453,8 +456,23 @@ def write_csv(path, rows):
 
 
 def select_best(rows, target_fpr):
-    """Exploratory selection only; final claims should be validated on another run."""
-    out = []
+    """Strict exploratory selection under the stated constraints.
+
+    Selection requirements
+    ----------------------
+    1. ``calibration_feasible`` must be True.
+    2. For min-run and sliding-window, the empirical clean exceedance check
+       must satisfy alpha_empirical <= alpha.  This is an evaluation-only
+       diagnostic that uses the known clean/noisy mask; it is not a deployable
+       calibration procedure.
+    3. Final cumulative detector FPR must satisfy FPR <= target_fpr.
+
+    There is intentionally NO fallback to best F1 when no configuration meets
+    the constraints.  Such a method-detector pair is reported explicitly as
+    having no feasible tested configuration.
+    """
+    best_rows = []
+    no_feasible_rows = []
 
     keys = sorted(
         set(
@@ -464,51 +482,79 @@ def select_best(rows, target_fpr):
     )
 
     for method, detector in keys:
-        rr = [
+        group = [
             r for r in rows
             if (
                 r["method"] == method
                 and r["detector"] == detector
-                and r["calibration_feasible"]
             )
         ]
-        if not rr:
+
+        calibration_valid = []
+        for r in group:
+            if not bool(r["calibration_feasible"]):
+                continue
+
+            if detector in {"min_run", "sliding_window"}:
+                if r.get("alpha_bound_satisfied_empirically", "") is not True:
+                    continue
+
+            calibration_valid.append(r)
+
+        fpr_feasible = [
+            r for r in calibration_valid
+            if (
+                np.isfinite(r["FPR"])
+                and r["FPR"] <= target_fpr
+            )
+        ]
+
+        if not fpr_feasible:
+            finite_fprs = [
+                float(r["FPR"])
+                for r in calibration_valid
+                if np.isfinite(r["FPR"])
+            ]
+
+            no_feasible_rows.append({
+                "method": method,
+                "detector": detector,
+                "selection_status": "no_feasible_tested_configuration",
+                "target_fpr": float(target_fpr),
+                "n_total_tested": int(len(group)),
+                "n_calibration_valid": int(len(calibration_valid)),
+                "minimum_fpr_among_calibration_valid": (
+                    float(min(finite_fprs))
+                    if finite_fprs
+                    else np.nan
+                ),
+                "reason": (
+                    "No tested configuration simultaneously satisfied "
+                    "calibration requirements and FPR <= target."
+                ),
+            })
             continue
 
-        feasible = [
-            r for r in rr
-            if np.isfinite(r["FPR"])
-            and r["FPR"] <= target_fpr
-        ]
-
-        if feasible:
-            candidates = feasible
-            candidates = sorted(
-                candidates,
-                key=lambda r: (
-                    -r["TPR"],
-                    r["FPR"],
-                    -r["precision"],
-                    (
-                        r["median_first_hit_noisy"]
-                        if np.isfinite(r["median_first_hit_noisy"])
-                        else float("inf")
-                    ),
+        candidates = sorted(
+            fpr_feasible,
+            key=lambda r: (
+                -r["TPR"],
+                r["FPR"],
+                -r["precision"],
+                (
+                    r["median_first_hit_noisy"]
+                    if np.isfinite(r["median_first_hit_noisy"])
+                    else float("inf")
                 ),
-            )
-        else:
-            candidates = sorted(
-                rr,
-                key=lambda r: (
-                    -r["F1"],
-                    -r["balanced_accuracy"],
-                    r["FPR"],
-                ),
-            )
+            ),
+        )
 
-        out.append(candidates[0])
+        best = dict(candidates[0])
+        best["selection_status"] = "feasible"
+        best["target_fpr"] = float(target_fpr)
+        best_rows.append(best)
 
-    return out
+    return best_rows, no_feasible_rows
 
 
 def base_auc_curve(score_nt, y, epochs, start_col):
@@ -1040,28 +1086,67 @@ def main():
     z_ckl_tn = z_ckl_full_tn[start_col:]
     z_le_tn = z_le_full_tn[start_col:]
 
-    # Base score AUCs on the same monitoring interval.
-    ckl_auc_rows, ckl_auc_curve, ckl_auc_max, ckl_auc_ep = base_auc_curve(
-        ckl_nt,
-        y,
-        epochs,
-        start_col,
+    # ----------------------------------------------------------
+    # Report BOTH raw-score and class-z AUCs on the same interval.
+    #
+    # Detectors 1-3 consume class-wise z-scores, so the ambiguous
+    # ``base_score_max_auc`` field below is defined as the CLASS-Z AUC.
+    # Raw AUC is retained explicitly as a separate diagnostic.
+    # ----------------------------------------------------------
+    ckl_raw_auc_rows, ckl_raw_auc_curve, ckl_raw_auc_max, ckl_raw_auc_ep = (
+        base_auc_curve(
+            ckl_nt,
+            y,
+            epochs,
+            start_col,
+        )
     )
-    le_auc_rows, le_auc_curve, le_auc_max, le_auc_ep = base_auc_curve(
-        le_gie_nt,
-        y,
-        epochs,
-        start_col,
+    le_raw_auc_rows, le_raw_auc_curve, le_raw_auc_max, le_raw_auc_ep = (
+        base_auc_curve(
+            le_gie_nt,
+            y,
+            epochs,
+            start_col,
+        )
     )
 
-    for r in ckl_auc_rows:
-        r["method"] = "CKL"
-    for r in le_auc_rows:
-        r["method"] = "LE_GIE"
+    ckl_z_nt = z_ckl_full_tn.T
+    le_z_nt = z_le_full_tn.T
+
+    ckl_z_auc_rows, ckl_z_auc_curve, ckl_z_auc_max, ckl_z_auc_ep = (
+        base_auc_curve(
+            ckl_z_nt,
+            y,
+            epochs,
+            start_col,
+        )
+    )
+    le_z_auc_rows, le_z_auc_curve, le_z_auc_max, le_z_auc_ep = (
+        base_auc_curve(
+            le_z_nt,
+            y,
+            epochs,
+            start_col,
+        )
+    )
+
+    base_auc_rows = []
+    for method, variant, rr in (
+        ("CKL", "raw", ckl_raw_auc_rows),
+        ("CKL", "class_z", ckl_z_auc_rows),
+        ("LE_GIE", "raw", le_raw_auc_rows),
+        ("LE_GIE", "class_z", le_z_auc_rows),
+    ):
+        for r in rr:
+            base_auc_rows.append({
+                "method": method,
+                "score_variant": variant,
+                **r,
+            })
 
     write_csv(
         args.output_dir / "base_score_auc_by_epoch.csv",
-        ckl_auc_rows + le_auc_rows,
+        base_auc_rows,
     )
 
     # ----------------------------------------------------------
@@ -1075,8 +1160,8 @@ def main():
             y=y,
             epochs_analysis=epochs_analysis,
             args=args,
-            base_auc_max=ckl_auc_max,
-            base_auc_epoch=ckl_auc_ep,
+            base_auc_max=ckl_z_auc_max,
+            base_auc_epoch=ckl_z_auc_ep,
         )
     )
     rows.extend(
@@ -1086,8 +1171,8 @@ def main():
             y=y,
             epochs_analysis=epochs_analysis,
             args=args,
-            base_auc_max=le_auc_max,
-            base_auc_epoch=le_auc_ep,
+            base_auc_max=le_z_auc_max,
+            base_auc_epoch=le_z_auc_ep,
         )
     )
 
@@ -1123,8 +1208,8 @@ def main():
             y=y,
             epochs_analysis=epochs_analysis,
             thresholds=args.pairwise_thresholds,
-            base_auc_max=ckl_auc_max,
-            base_auc_epoch=ckl_auc_ep,
+            base_auc_max=ckl_z_auc_max,
+            base_auc_epoch=ckl_z_auc_ep,
         )
     )
     rows.extend(
@@ -1134,24 +1219,52 @@ def main():
             y=y,
             epochs_analysis=epochs_analysis,
             thresholds=args.pairwise_thresholds,
-            base_auc_max=le_auc_max,
-            base_auc_epoch=le_auc_ep,
+            base_auc_max=le_z_auc_max,
+            base_auc_epoch=le_z_auc_ep,
         )
     )
+
+    # Add explicit score-level summaries.  ``base_score_max_auc`` already
+    # equals class-z AUC for compatibility with the previous table.
+    score_summaries = {
+        "CKL": {
+            "base_raw_score_max_auc": float(ckl_raw_auc_max),
+            "base_raw_score_argmax_epoch": int(ckl_raw_auc_ep),
+            "base_z_score_max_auc": float(ckl_z_auc_max),
+            "base_z_score_argmax_epoch": int(ckl_z_auc_ep),
+        },
+        "LE_GIE": {
+            "base_raw_score_max_auc": float(le_raw_auc_max),
+            "base_raw_score_argmax_epoch": int(le_raw_auc_ep),
+            "base_z_score_max_auc": float(le_z_auc_max),
+            "base_z_score_argmax_epoch": int(le_z_auc_ep),
+        },
+    }
+
+    for row in rows:
+        row["base_score_variant"] = "class_z"
+        row.update(score_summaries[row["method"]])
 
     write_csv(
         args.output_dir / "all_detector_combinations.csv",
         rows,
     )
 
-    best_rows = select_best(
+    best_rows, no_feasible_rows = select_best(
         rows,
         target_fpr=args.target_fpr,
     )
+
     write_csv(
         args.output_dir / "best_by_method_detector.csv",
         best_rows,
     )
+
+    if no_feasible_rows:
+        write_csv(
+            args.output_dir / "no_feasible_method_detector.csv",
+            no_feasible_rows,
+        )
 
     # ----------------------------------------------------------
     # Continuous cumulative-pairwise AUC + top-q by epoch.
@@ -1278,11 +1391,19 @@ def main():
         "ewma_lambdas": [float(x) for x in args.ewma_lambdas],
         "pairwise_thresholds":
             [float(x) for x in args.pairwise_thresholds],
+        "base_score_auc_reporting":
+            "both raw and within-observed-class z-score AUC are reported; base_score_max_auc in detector tables denotes class_z",
+        "strict_best_selection":
+            True,
+        "selection_rule":
+            "calibration_feasible; min-run/sliding also require empirical clean alpha bound; FPR <= target; maximize TPR; no fallback to best F1",
+        "alpha_bound_check_uses_known_clean_mask":
+            True,
         "top_fractions": [float(x) for x in args.top_fractions],
         "target_fpr_for_exploratory_best_table":
             float(args.target_fpr),
         "best_table_warning":
-            "best hyperparameters are selected on this evaluation run and require validation on an independent seed/run before final claims",
+            "best hyperparameters and the empirical alpha-bound check use this labeled evaluation run; validate on an independent seed/run before final claims",
         "n_samples": int(sample_index.size),
         "n_noisy": int(np.sum(y)),
     }
@@ -1300,7 +1421,20 @@ def main():
     print("Fourth detector uses exact all-peer cumulative comparison.")
     print()
     print(
-        f"Exploratory best configurations under FPR <= "
+        "Base-score AUC summary:"
+    )
+    print(
+        f"    CKL raw={ckl_raw_auc_max:.6f} @ {ckl_raw_auc_ep}, "
+        f"class-z={ckl_z_auc_max:.6f} @ {ckl_z_auc_ep}"
+    )
+    print(
+        f" LE-GIE raw={le_raw_auc_max:.6f} @ {le_raw_auc_ep}, "
+        f"class-z={le_z_auc_max:.6f} @ {le_z_auc_ep}"
+    )
+    print()
+
+    print(
+        f"Strict feasible configurations under FPR <= "
         f"{args.target_fpr:.3f}:"
     )
 
@@ -1319,6 +1453,22 @@ def main():
             f"F1={row['F1']:.4f} | "
             + ", ".join(hp)
         )
+
+    if no_feasible_rows:
+        print()
+        print("No feasible tested configuration:")
+        for row in no_feasible_rows:
+            min_fpr = row["minimum_fpr_among_calibration_valid"]
+            min_fpr_text = (
+                f"{min_fpr:.4f}"
+                if np.isfinite(min_fpr)
+                else "N/A"
+            )
+            print(
+                f"{row['method']:>7s} | "
+                f"{row['detector']:<20s} | "
+                f"minimum calibration-valid FPR={min_fpr_text}"
+            )
 
     print()
     print(f"Outputs: {args.output_dir}")
