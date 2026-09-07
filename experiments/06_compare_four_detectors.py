@@ -36,8 +36,9 @@ observed label.  Higher CKL or higher signed LE-GIE is treated as more
 noisy-like.  Ties contribute 0.5.
 
 The cumulative pairwise score is cumulative win mass divided by cumulative
-valid pair comparisons.  It is evaluated both as a continuous ranking score
-(AUC / top-q) and as a sequential threshold detector.
+valid pair comparisons.  This cumulative statistic IS the temporal detector.
+It is evaluated directly as a current ranking score (AUC / top-q).  No extra
+sticky "ever crossed rho" threshold is applied on top of it.
 
 Important
 ---------
@@ -154,15 +155,25 @@ def parse_args():
         default=(0.05, 0.1, 0.2),
     )
 
-    # Cumulative pairwise has its own score threshold rho.
+    # Cumulative pairwise is itself the temporal detector.
+    # We therefore evaluate the CURRENT cumulative score C_i(t) by ranking,
+    # without adding another sticky "ever crossed rho" layer.
     p.add_argument(
-        "--pairwise-thresholds",
+        "--primary-pairwise-top-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "Primary current-score operating point for cumulative pairwise. "
+            "For the 5%% synthetic-noise experiment, 0.05 matches the known "
+            "injected corruption fraction."
+        ),
+    )
+    p.add_argument(
+        "--pairwise-top-fractions",
         type=float,
         nargs="+",
-        default=(
-            0.60, 0.70, 0.80, 0.85, 0.90,
-            0.925, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995,
-        ),
+        default=(0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.15, 0.20),
+        help="Sensitivity grid for current cumulative-pairwise ranking.",
     )
 
     p.add_argument(
@@ -183,7 +194,7 @@ def parse_args():
         "--output-dir",
         type=Path,
         default=Path(
-            "results/four_detector_comparison_corrected"
+            "results/four_detector_comparison_pairwise_current"
         ),
     )
 
@@ -209,9 +220,18 @@ def parse_args():
     for lam in args.ewma_lambdas:
         if not 0.0 < lam <= 1.0:
             p.error("--ewma-lambdas must lie in (0,1].")
-    for rho in args.pairwise_thresholds:
-        if not 0.0 <= rho <= 1.0:
-            p.error("--pairwise-thresholds must lie in [0,1].")
+    if not 0.0 < args.primary_pairwise_top_fraction < 1.0:
+        p.error("--primary-pairwise-top-fraction must lie in (0,1).")
+    for q in args.pairwise_top_fractions:
+        if not 0.0 < q < 1.0:
+            p.error("--pairwise-top-fractions must lie in (0,1).")
+    if args.primary_pairwise_top_fraction not in args.pairwise_top_fractions:
+        args.pairwise_top_fractions = tuple(
+            sorted(
+                set(args.pairwise_top_fractions)
+                | {float(args.primary_pairwise_top_fraction)}
+            )
+        )
     for q in args.top_fractions:
         if not 0.0 < q < 1.0:
             p.error("--top-fractions must lie in (0,1).")
@@ -735,43 +755,171 @@ def build_detector_rows(
     return rows
 
 
-def cumulative_pairwise_rows(
+def top_fraction_selection(score, q):
+    """Boolean top-q selection from one continuous score vector."""
+    score = np.asarray(score, dtype=np.float64)
+    N = score.size
+    finite_idx = np.flatnonzero(np.isfinite(score))
+    k = min(
+        max(1, int(round(float(q) * N))),
+        finite_idx.size,
+    )
+
+    selected = np.zeros(N, dtype=bool)
+    if k:
+        fs = score[finite_idx]
+        local = np.argpartition(fs, -k)[-k:]
+        selected[finite_idx[local]] = True
+    return selected
+
+
+def top_fraction_selection_trajectory(score_nt, q):
+    """Current (non-sticky) top-q selection at every epoch."""
+    score_nt = np.asarray(score_nt, dtype=np.float64)
+    N, T = score_nt.shape
+    out = np.zeros((T, N), dtype=bool)
+    for t in range(T):
+        out[t] = top_fraction_selection(score_nt[:, t], q)
+    return out
+
+
+def cumulative_pairwise_primary_row(
     *,
     method,
     cumulative_nt,
     y,
     epochs_analysis,
-    thresholds,
+    primary_q,
     base_auc_max,
     base_auc_epoch,
 ):
-    rows = []
-    cumulative_tn = np.asarray(
-        cumulative_nt,
-        dtype=np.float64,
-    ).T
+    """Primary fourth-detector row.
 
-    for rho in thresholds:
-        hit, ever, _ = threshold_continuous_score(
-            cumulative_tn,
-            rho,
-        )
+    The cumulative pairwise statistic C_i(t) already aggregates temporal
+    evidence.  We therefore evaluate C_i(t) directly at the epoch where its
+    ranking AUC is maximal, using a fixed top-q current-score operating point.
 
-        rows.append(
-            summarize_sequential(
-                method=method,
-                detector="cumulative_pairwise",
-                params={"rho": float(rho)},
-                hit_tn=hit,
-                ever_tn=ever,
-                y=y,
-                epochs=epochs_analysis,
-                base_auc_max=base_auc_max,
-                base_auc_epoch=base_auc_epoch,
-            )
-        )
+    This intentionally does NOT apply an additional sticky "ever crossed rho"
+    rule.
+    """
+    cumulative_nt = np.asarray(cumulative_nt, dtype=np.float64)
 
-    return rows
+    aucs = np.full(cumulative_nt.shape[1], np.nan, dtype=np.float64)
+    for t in range(cumulative_nt.shape[1]):
+        aucs[t] = auc_binary(y, cumulative_nt[:, t])
+
+    finite = np.flatnonzero(np.isfinite(aucs))
+    if finite.size == 0:
+        raise RuntimeError(f"No finite cumulative-pairwise AUC for {method}.")
+
+    best_t = int(finite[np.nanargmax(aucs[finite])])
+    best_epoch = int(epochs_analysis[best_t])
+
+    metrics = top_fraction_metrics(
+        y,
+        cumulative_nt[:, best_t],
+        primary_q,
+    )
+
+    return {
+        "method": method,
+        "detector": "cumulative_pairwise",
+        "selection_status": "primary_current_score_top_q",
+        "q": float(primary_q),
+        "evaluation_epoch": best_epoch,
+        "pairwise_auc_at_evaluation_epoch": float(aucs[best_t]),
+        "tau": "",
+        "alpha": "",
+        "delta": "",
+        "m": "",
+        "ell": "",
+        "k": "",
+        "lambda": "",
+        "rho": "",
+        "calibration_feasible": True,
+        "empirical_clean_alpha_sup": np.nan,
+        "alpha_bound_satisfied_empirically": "",
+        **metrics,
+        "final_noisy_detection_rate": np.nan,
+        "final_clean_false_alarm_rate": np.nan,
+        "median_first_hit_noisy": np.nan,
+        "median_first_hit_clean": np.nan,
+        "epoch_at_50pct_noisy_detection": -1,
+        "epoch_at_80pct_noisy_detection": -1,
+        "epoch_at_90pct_noisy_detection": -1,
+        "base_score_max_auc": float(base_auc_max),
+        "base_score_argmax_epoch": int(base_auc_epoch),
+        "note": (
+            "Current cumulative pairwise ranking at its best-AUC epoch; "
+            "no extra sticky threshold layer."
+        ),
+    }
+
+
+def max_tpr_under_fpr_budget(y, score, target_fpr):
+    """Evaluation-only ROC operating point.
+
+    Scans score thresholds and returns the largest TPR with FPR <= target_fpr.
+    This uses the known noisy-label mask and is therefore an oracle diagnostic,
+    not a deployable threshold-selection procedure.
+    """
+    y = np.asarray(y, dtype=bool)
+    score = np.asarray(score, dtype=np.float64)
+
+    finite = np.isfinite(score)
+    y_f = y[finite]
+    s_f = score[finite]
+
+    n_pos = int(np.sum(y_f))
+    n_neg = int(np.sum(~y_f))
+    if n_pos == 0 or n_neg == 0 or s_f.size == 0:
+        return {
+            "threshold": np.nan,
+            "TPR": np.nan,
+            "FPR": np.nan,
+            "precision": np.nan,
+            "n_selected": 0,
+        }
+
+    order = np.argsort(-s_f, kind="mergesort")
+    ys = y_f[order]
+    ss = s_f[order]
+
+    tp = np.cumsum(ys.astype(np.int64))
+    fp = np.cumsum((~ys).astype(np.int64))
+
+    tpr = tp / n_pos
+    fpr = fp / n_neg
+
+    ok = np.flatnonzero(fpr <= float(target_fpr))
+    if ok.size == 0:
+        return {
+            "threshold": np.inf,
+            "TPR": 0.0,
+            "FPR": 0.0,
+            "precision": np.nan,
+            "n_selected": 0,
+        }
+
+    # Max TPR; among ties prefer lower FPR and fewer selected.
+    best_tpr = np.nanmax(tpr[ok])
+    cand = ok[np.isclose(tpr[ok], best_tpr)]
+    if cand.size > 1:
+        cand = cand[np.argsort(fpr[cand], kind="mergesort")]
+    idx = int(cand[0])
+
+    selected = idx + 1
+    precision = tp[idx] / selected
+
+    return {
+        "threshold": float(ss[idx]),
+        "TPR": float(tpr[idx]),
+        "FPR": float(fpr[idx]),
+        "precision": float(precision),
+        "n_selected": int(selected),
+        "selection_fraction": float(selected / y.size),
+    }
+
 
 
 def reconstruct_best_curves(
@@ -817,11 +965,12 @@ def reconstruct_best_curves(
         return result["ewma"]["ever_detected"]
 
     if detector == "cumulative_pairwise":
-        _, ever, _ = threshold_continuous_score(
-            pair_cum_nt.T,
-            float(row["rho"]),
+        # Current top-q selection from the already cumulative statistic.
+        # No "ever crossed threshold" / sticky layer is applied.
+        return top_fraction_selection_trajectory(
+            pair_cum_nt,
+            float(row["q"]),
         )
-        return ever
 
     raise ValueError(detector)
 
@@ -867,7 +1016,7 @@ def plot_best_by_method(
         )
 
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Cumulative detection fraction")
+    ax.set_ylabel("Detected / selected fraction")
     ax.set_ylim(0.0, 1.0)
     ax.set_title(
         f"{method}: best four temporal detectors"
@@ -925,7 +1074,7 @@ def plot_ckl_vs_le_for_detector(
         )
 
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Cumulative detection fraction")
+    ax.set_ylabel("Detected / selected fraction")
     ax.set_ylim(0.0, 1.0)
     ax.set_title(f"CKL vs LE-GIE — {detector}")
     ax.legend()
@@ -971,7 +1120,6 @@ def main():
             "epoch",
             "observed_label",
             "is_anomaly",
-            "ell_err_traj",
         ),
         "LE",
     )
@@ -1028,28 +1176,50 @@ def main():
         ckl["ckl_traj"],
         dtype=np.float64,
     )
-    ell_err_nt = np.asarray(
-        le["ell_err_traj"],
-        dtype=np.float64,
-    )
+    # ----------------------------------------------------------
+    # LE-GIE source
+    # ----------------------------------------------------------
+    # Final/frozen artifacts contain the COMPLETE consistent LE trajectory.
+    # Prefer that directly.  Legacy artifacts containing only ell_err_traj
+    # still follow the previous recomputation path unchanged.
+    if "le_gie_traj" in le.files:
+        le_gie_nt = np.asarray(
+            le["le_gie_traj"],
+            dtype=np.float64,
+        )
+        le_score_source = "precomputed_le_gie_traj"
+    elif "lambda_traj" in le.files:
+        le_gie_nt = np.asarray(
+            le["lambda_traj"],
+            dtype=np.float64,
+        )
+        le_score_source = "precomputed_lambda_traj"
+    elif "ell_err_traj" in le.files:
+        ell_err_nt = np.asarray(
+            le["ell_err_traj"],
+            dtype=np.float64,
+        )
 
-    # ----------------------------------------------------------
-    # LE-GIE = ell_err + log(abs(m_GIE))
-    # ----------------------------------------------------------
-    gie = rolling_class_reference_gie_batch(
-        loss_traj,
-        labels,
-        K=args.K,
-        num_classes=args.num_classes,
-    )
-    id_gie_nt = np.asarray(
-        gie["id_gie_traj"],
-        dtype=np.float64,
-    )
-    le_gie_nt = compose_le_from_error_and_m(
-        ell_err_nt,
-        id_gie_nt,
-    )
+        gie = rolling_class_reference_gie_batch(
+            loss_traj,
+            labels,
+            K=args.K,
+            num_classes=args.num_classes,
+        )
+        id_gie_nt = np.asarray(
+            gie["id_gie_traj"],
+            dtype=np.float64,
+        )
+        le_gie_nt = compose_le_from_error_and_m(
+            ell_err_nt,
+            id_gie_nt,
+        )
+        le_score_source = "legacy_ell_err_plus_recomputed_gie"
+    else:
+        raise KeyError(
+            "LE artifact must contain le_gie_traj, lambda_traj, "
+            "or legacy ell_err_traj."
+        )
 
     # Common first epoch where both raw score families are available.
     common_cols = np.flatnonzero(
@@ -1201,28 +1371,28 @@ def main():
         dtype=np.float64,
     )[:, start_col:]
 
-    rows.extend(
-        cumulative_pairwise_rows(
+    # The fourth detector is the cumulative pairwise statistic itself.
+    # Do NOT add a second sticky threshold layer on top of it.
+    pairwise_primary_rows = [
+        cumulative_pairwise_primary_row(
             method="CKL",
             cumulative_nt=pair_ckl_cum_nt,
             y=y,
             epochs_analysis=epochs_analysis,
-            thresholds=args.pairwise_thresholds,
+            primary_q=args.primary_pairwise_top_fraction,
             base_auc_max=ckl_z_auc_max,
             base_auc_epoch=ckl_z_auc_ep,
-        )
-    )
-    rows.extend(
-        cumulative_pairwise_rows(
+        ),
+        cumulative_pairwise_primary_row(
             method="LE_GIE",
             cumulative_nt=pair_le_cum_nt,
             y=y,
             epochs_analysis=epochs_analysis,
-            thresholds=args.pairwise_thresholds,
+            primary_q=args.primary_pairwise_top_fraction,
             base_auc_max=le_z_auc_max,
             base_auc_epoch=le_z_auc_ep,
-        )
-    )
+        ),
+    ]
 
     # Add explicit score-level summaries.  ``base_score_max_auc`` already
     # equals class-z AUC for compatibility with the previous table.
@@ -1250,10 +1420,14 @@ def main():
         rows,
     )
 
+    # Strict FPR/calibration selection applies to the first three
+    # z-threshold-based detectors.  Cumulative pairwise is evaluated by its
+    # fixed current-score top-q operating point, matching the prior experiment.
     best_rows, no_feasible_rows = select_best(
         rows,
         target_fpr=args.target_fpr,
     )
+    best_rows.extend(pairwise_primary_rows)
 
     write_csv(
         args.output_dir / "best_by_method_detector.csv",
@@ -1298,6 +1472,68 @@ def main():
     write_csv(
         args.output_dir / "cumulative_pairwise_auc_topq_by_epoch.csv",
         pair_rows,
+    )
+
+    # ----------------------------------------------------------
+    # Extra cumulative-LE/CKL diagnostics:
+    #   (a) top-q sensitivity at the best-AUC epoch;
+    #   (b) maximum TPR attainable at each epoch under FPR <= target.
+    #
+    # (b) uses the known anomaly mask and is explicitly ORACLE / evaluation-only.
+    # ----------------------------------------------------------
+    pairwise_sensitivity_rows = []
+    pairwise_fpr_budget_rows = []
+
+    for method, score_nt in (
+        ("CKL", pair_ckl_cum_nt),
+        ("LE_GIE", pair_le_cum_nt),
+    ):
+        aucs = np.asarray(
+            [
+                auc_binary(y, score_nt[:, t])
+                for t in range(score_nt.shape[1])
+            ],
+            dtype=np.float64,
+        )
+        finite = np.flatnonzero(np.isfinite(aucs))
+        best_t = int(finite[np.nanargmax(aucs[finite])])
+        best_ep = int(epochs_analysis[best_t])
+
+        for q in args.pairwise_top_fractions:
+            m = top_fraction_metrics(
+                y,
+                score_nt[:, best_t],
+                q,
+            )
+            pairwise_sensitivity_rows.append({
+                "method": method,
+                "epoch": best_ep,
+                "auc": float(aucs[best_t]),
+                **m,
+            })
+
+        for t, ep in enumerate(epochs_analysis):
+            op = max_tpr_under_fpr_budget(
+                y,
+                score_nt[:, t],
+                args.target_fpr,
+            )
+            pairwise_fpr_budget_rows.append({
+                "method": method,
+                "epoch": int(ep),
+                "auc": float(aucs[t]),
+                "target_fpr": float(args.target_fpr),
+                **op,
+                "oracle_evaluation_only": True,
+            })
+
+    write_csv(
+        args.output_dir / "pairwise_topq_sensitivity_at_best_auc.csv",
+        pairwise_sensitivity_rows,
+    )
+    write_csv(
+        args.output_dir / "pairwise_oracle_max_tpr_under_fpr_budget_by_epoch.csv",
+        pairwise_fpr_budget_rows,
     )
 
     # Save compact arrays.
@@ -1371,6 +1607,7 @@ def main():
         "le_npz": str(args.le_npz),
         "K": int(args.K),
         "le_formula": "ell_err + log(abs(m_GIE))",
+        "le_score_source": le_score_source,
         "gie_reference": "mean loss trajectory of samples sharing observed label",
         "common_start_epoch": start_epoch,
         "first_three_detector_input":
@@ -1389,12 +1626,18 @@ def main():
         "deltas": [float(x) for x in args.deltas],
         "window_lengths": [int(x) for x in args.window_lengths],
         "ewma_lambdas": [float(x) for x in args.ewma_lambdas],
-        "pairwise_thresholds":
-            [float(x) for x in args.pairwise_thresholds],
+        "primary_pairwise_top_fraction":
+            float(args.primary_pairwise_top_fraction),
+        "pairwise_top_fractions":
+            [float(x) for x in args.pairwise_top_fractions],
+        "cumulative_pairwise_decision_rule":
+            "current cumulative score ranked at each epoch; primary decision is current top-q; no extra sticky threshold",
+        "pairwise_oracle_fpr_budget_diagnostic":
+            "evaluation-only maximum TPR subject to FPR target, computed using known anomaly labels",
         "base_score_auc_reporting":
             "both raw and within-observed-class z-score AUC are reported; base_score_max_auc in detector tables denotes class_z",
         "strict_best_selection":
-            True,
+            "applies to min-run, sliding-window, and EWMA only; cumulative pairwise uses fixed current-score top-q",
         "selection_rule":
             "calibration_feasible; min-run/sliding also require empirical clean alpha bound; FPR <= target; maximize TPR; no fallback to best F1",
         "alpha_bound_check_uses_known_clean_mask":
@@ -1440,7 +1683,7 @@ def main():
 
     for row in best_rows:
         hp = []
-        for key in ("tau", "alpha", "delta", "m", "ell", "k", "lambda", "rho"):
+        for key in ("tau", "alpha", "delta", "m", "ell", "k", "lambda", "q", "evaluation_epoch"):
             value = row.get(key, "")
             if value != "":
                 hp.append(f"{key}={value}")
@@ -1470,7 +1713,34 @@ def main():
                 f"minimum calibration-valid FPR={min_fpr_text}"
             )
 
+    # Evaluation-only indication of whether the cumulative score can exceed
+    # the primary top-5% TPR while still staying under the same FPR budget.
+    le_oracle = [
+        r for r in pairwise_fpr_budget_rows
+        if r["method"] == "LE_GIE"
+        and np.isfinite(r["TPR"])
+    ]
+    if le_oracle:
+        best_oracle = max(
+            le_oracle,
+            key=lambda r: (r["TPR"], -r["FPR"]),
+        )
+        print()
+        print(
+            "LE-GIE cumulative pairwise oracle under "
+            f"FPR <= {args.target_fpr:.3f}: "
+            f"TPR={best_oracle['TPR']:.4f}, "
+            f"FPR={best_oracle['FPR']:.4f}, "
+            f"epoch={best_oracle['epoch']}, "
+            f"selected_fraction={best_oracle['selection_fraction']:.4f}"
+        )
+        print(
+            "  (evaluation-only threshold; do not treat this as a "
+            "deployable tuned detector without independent calibration)"
+        )
+
     print()
+    print(f"LE score source: {le_score_source}")
     print(f"Outputs: {args.output_dir}")
 
 

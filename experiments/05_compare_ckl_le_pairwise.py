@@ -733,7 +733,6 @@ def main():
             "epoch",
             "observed_label",
             "is_anomaly",
-            "ell_err_traj",
         ),
         name="LE",
     )
@@ -832,31 +831,50 @@ def main():
         ckl["ckl_traj"],
         dtype=np.float64,
     )
-    ell_err = np.asarray(
-        le["ell_err_traj"],
-        dtype=np.float64,
-    )
-
     # --------------------------------------------------------------
-    # LE-GIE
+    # LE-GIE source
     # --------------------------------------------------------------
+    # Final/frozen artifacts contain the COMPLETE consistent LE trajectory.
+    # Prefer that directly.  Legacy artifacts containing only ell_err_traj
+    # still follow the previous recomputation path unchanged.
+    if "le_gie_traj" in le.files:
+        le_gie = np.asarray(
+            le["le_gie_traj"],
+            dtype=np.float64,
+        )
+        le_score_source = "precomputed_le_gie_traj"
+    elif "lambda_traj" in le.files:
+        le_gie = np.asarray(
+            le["lambda_traj"],
+            dtype=np.float64,
+        )
+        le_score_source = "precomputed_lambda_traj"
+    elif "ell_err_traj" in le.files:
+        ell_err = np.asarray(
+            le["ell_err_traj"],
+            dtype=np.float64,
+        )
 
-    gie = rolling_class_reference_gie_batch(
-        loss_traj,
-        labels,
-        K=args.K,
-        num_classes=args.num_classes,
-    )
-
-    id_gie = np.asarray(
-        gie["id_gie_traj"],
-        dtype=np.float64,
-    )
-
-    le_gie = compose_le_from_error_and_m(
-        ell_err,
-        id_gie,
-    )
+        gie = rolling_class_reference_gie_batch(
+            loss_traj,
+            labels,
+            K=args.K,
+            num_classes=args.num_classes,
+        )
+        id_gie = np.asarray(
+            gie["id_gie_traj"],
+            dtype=np.float64,
+        )
+        le_gie = compose_le_from_error_and_m(
+            ell_err,
+            id_gie,
+        )
+        le_score_source = "legacy_ell_err_plus_recomputed_gie"
+    else:
+        raise KeyError(
+            "LE artifact must contain le_gie_traj, lambda_traj, "
+            "or legacy ell_err_traj."
+        )
 
     # Primary comparison begins when CKL and LE-GIE are both available.
     finite_ckl_by_t = np.any(
@@ -1177,6 +1195,8 @@ def main():
             int(args.K),
         "le_formula":
             "ell_err + log(abs(m_GIE))",
+        "le_score_source":
+            le_score_source,
         "gie_reference":
             "mean loss trajectory of samples sharing observed label",
         "pairwise_peer_scope":
@@ -1246,6 +1266,7 @@ def main():
         )
 
     print()
+    print(f"LE score source: {le_score_source}")
     print(f"Outputs: {args.output_dir}")
 
 
