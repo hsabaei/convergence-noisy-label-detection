@@ -922,6 +922,291 @@ def max_tpr_under_fpr_budget(y, score, target_fpr):
 
 
 
+
+def metrics_at_epoch_from_curve(
+    selected_tn,
+    y,
+    epoch_index,
+):
+    """Binary metrics for one detector trajectory at one epoch."""
+    pred = np.asarray(selected_tn, dtype=bool)[int(epoch_index)]
+    return binary_metrics(y, pred)
+
+
+def _valid_calibrated_row(row):
+    """Apply the existing feasibility/calibration rules."""
+    if not bool(row.get("calibration_feasible", True)):
+        return False
+
+    detector = row["detector"]
+    if detector in {"min_run", "sliding_window"}:
+        if row.get("alpha_bound_satisfied_empirically", "") is not True:
+            return False
+
+    return True
+
+
+def select_best_cases_all_detectors(
+    *,
+    detector_rows,
+    z_by_method,
+    pair_by_method,
+    y,
+    epochs_analysis,
+    pairwise_q_values,
+    target_fpr,
+):
+    """Select each method/detector's best tested operating point.
+
+    FAIR BEST-CASE RULE
+    -------------------
+    For EVERY detector, search its tested operating points and evaluation
+    epochs, retain only points with FPR <= target_fpr, and maximize TPR.
+
+    Min-run and sliding-window additionally retain the same calibration
+    feasibility / empirical-alpha checks already used by this experiment.
+
+    Cumulative pairwise searches the tested top-q values and epochs directly.
+    It does NOT add a sticky threshold on top of the cumulative score.
+
+    IMPORTANT
+    ---------
+    This is an exploratory, label-informed best-case comparison because the
+    known noisy-label mask is used to select hyperparameters / q / epoch.
+    The chosen settings must be frozen and validated on an independent run
+    before being treated as deployable.
+    """
+    best_rows = []
+    no_feasible = []
+
+    methods = sorted(z_by_method.keys())
+
+    # ----------------------------------------------------------
+    # First three detectors: scan every tested hyperparameter row
+    # and every evaluation epoch.
+    # ----------------------------------------------------------
+    for method in methods:
+        z_tn = z_by_method[method]
+
+        for detector in ("min_run", "sliding_window", "ewma"):
+            group = [
+                r for r in detector_rows
+                if r["method"] == method
+                and r["detector"] == detector
+                and _valid_calibrated_row(r)
+            ]
+
+            candidates = []
+
+            for row in group:
+                selected_tn = reconstruct_best_curves(
+                    row,
+                    z_tn=z_tn,
+                    pair_cum_nt=pair_by_method[method],
+                    epochs_analysis=epochs_analysis,
+                )
+
+                tpr_curve, fpr_curve = detection_curve(
+                    selected_tn,
+                    y,
+                )
+
+                for t, ep in enumerate(epochs_analysis):
+                    tpr = float(tpr_curve[t])
+                    fpr = float(fpr_curve[t])
+
+                    if (
+                        np.isfinite(tpr)
+                        and np.isfinite(fpr)
+                        and fpr <= float(target_fpr)
+                    ):
+                        m = metrics_at_epoch_from_curve(
+                            selected_tn,
+                            y,
+                            t,
+                        )
+
+                        cand = dict(row)
+                        cand.update(m)
+                        cand.update({
+                            "selection_status":
+                                "best_tested_case_under_fpr_budget",
+                            "evaluation_epoch": int(ep),
+                            "evaluation_epoch_index": int(t),
+                            "target_fpr": float(target_fpr),
+                            "comparison_basis":
+                                "maximize TPR over tested hyperparameters and epochs subject to FPR budget",
+                        })
+                        candidates.append(cand)
+
+            if not candidates:
+                no_feasible.append({
+                    "method": method,
+                    "detector": detector,
+                    "selection_status":
+                        "no_feasible_tested_case",
+                    "target_fpr": float(target_fpr),
+                })
+                continue
+
+            candidates.sort(
+                key=lambda r: (
+                    -float(r["TPR"]),
+                    float(r["FPR"]),
+                    -float(r["precision"])
+                    if np.isfinite(r["precision"])
+                    else 0.0,
+                    int(r["evaluation_epoch"]),
+                )
+            )
+
+            best_rows.append(candidates[0])
+
+    # ----------------------------------------------------------
+    # Fourth detector: scan q AND epoch under the same FPR budget.
+    # ----------------------------------------------------------
+    for method in methods:
+        score_nt = np.asarray(
+            pair_by_method[method],
+            dtype=np.float64,
+        )
+
+        pair_candidates = []
+
+        for q in pairwise_q_values:
+            selected_tn = top_fraction_selection_trajectory(
+                score_nt,
+                float(q),
+            )
+            tpr_curve, fpr_curve = detection_curve(
+                selected_tn,
+                y,
+            )
+
+            for t, ep in enumerate(epochs_analysis):
+                tpr = float(tpr_curve[t])
+                fpr = float(fpr_curve[t])
+
+                if (
+                    np.isfinite(tpr)
+                    and np.isfinite(fpr)
+                    and fpr <= float(target_fpr)
+                ):
+                    m = metrics_at_epoch_from_curve(
+                        selected_tn,
+                        y,
+                        t,
+                    )
+
+                    auc = auc_binary(
+                        y,
+                        score_nt[:, t],
+                    )
+
+                    pair_candidates.append({
+                        "method": method,
+                        "detector": "cumulative_pairwise",
+                        "selection_status":
+                            "best_tested_case_under_fpr_budget",
+                        "q": float(q),
+                        "evaluation_epoch": int(ep),
+                        "evaluation_epoch_index": int(t),
+                        "pairwise_auc_at_evaluation_epoch":
+                            float(auc),
+                        "tau": "",
+                        "alpha": "",
+                        "delta": "",
+                        "m": "",
+                        "ell": "",
+                        "k": "",
+                        "lambda": "",
+                        "rho": "",
+                        "calibration_feasible": True,
+                        "empirical_clean_alpha_sup": np.nan,
+                        "alpha_bound_satisfied_empirically": "",
+                        **m,
+                        "target_fpr": float(target_fpr),
+                        "comparison_basis":
+                            "maximize TPR over tested q and epochs subject to FPR budget",
+                        "note":
+                            "Current cumulative pairwise ranking; no extra sticky threshold.",
+                    })
+
+        if not pair_candidates:
+            no_feasible.append({
+                "method": method,
+                "detector": "cumulative_pairwise",
+                "selection_status":
+                    "no_feasible_tested_case",
+                "target_fpr": float(target_fpr),
+            })
+            continue
+
+        pair_candidates.sort(
+            key=lambda r: (
+                -float(r["TPR"]),
+                float(r["FPR"]),
+                -float(r["precision"])
+                if np.isfinite(r["precision"])
+                else 0.0,
+                int(r["evaluation_epoch"]),
+            )
+        )
+
+        best_rows.append(pair_candidates[0])
+
+    return best_rows, no_feasible
+
+
+def plot_best_case_summary(
+    best_rows,
+    path,
+):
+    """Compact bar plot of the selected best-case TPR/FPR values."""
+    ordered_detectors = [
+        "ewma",
+        "min_run",
+        "sliding_window",
+        "cumulative_pairwise",
+    ]
+    methods = ["CKL", "LE_GIE"]
+
+    labels = []
+    tpr = []
+    fpr = []
+
+    for method in methods:
+        for detector in ordered_detectors:
+            match = [
+                r for r in best_rows
+                if r["method"] == method
+                and r["detector"] == detector
+            ]
+            if not match:
+                continue
+            row = match[0]
+            labels.append(f"{method}\n{detector}")
+            tpr.append(float(row["TPR"]))
+            fpr.append(float(row["FPR"]))
+
+    x = np.arange(len(labels), dtype=float)
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width / 2, tpr, width, label="TPR")
+    ax.bar(x + width / 2, fpr, width, label="FPR")
+    ax.axhline(0.05, linestyle="--", linewidth=1, label="FPR budget = 0.05")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("Fraction")
+    ax.set_title("Best tested detector cases under FPR <= 0.05")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def reconstruct_best_curves(
     row,
     *,
@@ -1371,31 +1656,19 @@ def main():
         dtype=np.float64,
     )[:, start_col:]
 
-    # The fourth detector is the cumulative pairwise statistic itself.
-    # Do NOT add a second sticky threshold layer on top of it.
-    pairwise_primary_rows = [
-        cumulative_pairwise_primary_row(
-            method="CKL",
-            cumulative_nt=pair_ckl_cum_nt,
-            y=y,
-            epochs_analysis=epochs_analysis,
-            primary_q=args.primary_pairwise_top_fraction,
-            base_auc_max=ckl_z_auc_max,
-            base_auc_epoch=ckl_z_auc_ep,
-        ),
-        cumulative_pairwise_primary_row(
-            method="LE_GIE",
-            cumulative_nt=pair_le_cum_nt,
-            y=y,
-            epochs_analysis=epochs_analysis,
-            primary_q=args.primary_pairwise_top_fraction,
-            base_auc_max=le_z_auc_max,
-            base_auc_epoch=le_z_auc_ep,
-        ),
-    ]
+    # ----------------------------------------------------------
+    # FAIR BEST-CASE COMPARISON
+    # ----------------------------------------------------------
+    # For ALL FOUR detectors, select the best tested operating point
+    # under the SAME FPR budget.  This scans hyperparameters/q AND
+    # evaluation epoch, then maximizes TPR subject to FPR <= target.
+    #
+    # This is intentionally exploratory and label-informed.  The selected
+    # settings must later be frozen and validated on an independent run.
+    # ----------------------------------------------------------
 
-    # Add explicit score-level summaries.  ``base_score_max_auc`` already
-    # equals class-z AUC for compatibility with the previous table.
+    # Add explicit score-level summaries to the exhaustive first-three
+    # detector rows.
     score_summaries = {
         "CKL": {
             "base_raw_score_max_auc": float(ckl_raw_auc_max),
@@ -1420,15 +1693,28 @@ def main():
         rows,
     )
 
-    # Strict FPR/calibration selection applies to the first three
-    # z-threshold-based detectors.  Cumulative pairwise is evaluated by its
-    # fixed current-score top-q operating point, matching the prior experiment.
-    best_rows, no_feasible_rows = select_best(
-        rows,
+    best_rows, no_feasible_rows = select_best_cases_all_detectors(
+        detector_rows=rows,
+        z_by_method={
+            "CKL": z_ckl_full_tn[start_col:],
+            "LE_GIE": z_le_full_tn[start_col:],
+        },
+        pair_by_method={
+            "CKL": pair_ckl_cum_nt,
+            "LE_GIE": pair_le_cum_nt,
+        },
+        y=y,
+        epochs_analysis=epochs_analysis,
+        pairwise_q_values=args.pairwise_top_fractions,
         target_fpr=args.target_fpr,
     )
-    best_rows.extend(pairwise_primary_rows)
 
+    # Attach score-level summaries also to the selected pairwise rows.
+    for row in best_rows:
+        row["base_score_variant"] = "class_z"
+        row.update(score_summaries[row["method"]])
+
+    # Main table now means BEST TESTED CASE for every detector.
     write_csv(
         args.output_dir / "best_by_method_detector.csv",
         best_rows,
@@ -1439,6 +1725,11 @@ def main():
             args.output_dir / "no_feasible_method_detector.csv",
             no_feasible_rows,
         )
+
+    plot_best_case_summary(
+        best_rows,
+        args.output_dir / "fig_best_case_tpr_fpr.png",
+    )
 
     # ----------------------------------------------------------
     # Continuous cumulative-pairwise AUC + top-q by epoch.
@@ -1626,27 +1917,27 @@ def main():
         "deltas": [float(x) for x in args.deltas],
         "window_lengths": [int(x) for x in args.window_lengths],
         "ewma_lambdas": [float(x) for x in args.ewma_lambdas],
-        "primary_pairwise_top_fraction":
+        "legacy_primary_pairwise_top_fraction":
             float(args.primary_pairwise_top_fraction),
         "pairwise_top_fractions":
             [float(x) for x in args.pairwise_top_fractions],
         "cumulative_pairwise_decision_rule":
-            "current cumulative score ranked at each epoch; primary decision is current top-q; no extra sticky threshold",
+            "current cumulative score ranked at each epoch; best-case comparison searches tested q and epoch; no extra sticky threshold",
         "pairwise_oracle_fpr_budget_diagnostic":
             "evaluation-only maximum TPR subject to FPR target, computed using known anomaly labels",
         "base_score_auc_reporting":
             "both raw and within-observed-class z-score AUC are reported; base_score_max_auc in detector tables denotes class_z",
         "strict_best_selection":
-            "applies to min-run, sliding-window, and EWMA only; cumulative pairwise uses fixed current-score top-q",
+            "all four detectors: maximize TPR over tested operating points and epochs subject to FPR target; min-run/sliding also require calibration validity",
         "selection_rule":
-            "calibration_feasible; min-run/sliding also require empirical clean alpha bound; FPR <= target; maximize TPR; no fallback to best F1",
+            "best tested case for every detector: FPR <= target then maximize TPR over hyperparameters/q and evaluation epoch; min-run/sliding also require empirical clean alpha bound; no fallback to best F1",
         "alpha_bound_check_uses_known_clean_mask":
             True,
         "top_fractions": [float(x) for x in args.top_fractions],
         "target_fpr_for_exploratory_best_table":
             float(args.target_fpr),
         "best_table_warning":
-            "best hyperparameters and the empirical alpha-bound check use this labeled evaluation run; validate on an independent seed/run before final claims",
+            "best hyperparameters/q AND evaluation epoch are selected using this labeled evaluation run; this is exploratory best-case performance and must be validated on an independent seed/run before final claims",
         "n_samples": int(sample_index.size),
         "n_noisy": int(np.sum(y)),
     }
@@ -1677,8 +1968,9 @@ def main():
     print()
 
     print(
-        f"Strict feasible configurations under FPR <= "
-        f"{args.target_fpr:.3f}:"
+        f"Best tested cases under FPR <= "
+        f"{args.target_fpr:.3f} "
+        f"(hyperparameters/q and epoch selected for every detector):"
     )
 
     for row in best_rows:
@@ -1727,7 +2019,7 @@ def main():
         )
         print()
         print(
-            "LE-GIE cumulative pairwise oracle under "
+            "LE-GIE continuous-threshold oracle diagnostic under "
             f"FPR <= {args.target_fpr:.3f}: "
             f"TPR={best_oracle['TPR']:.4f}, "
             f"FPR={best_oracle['FPR']:.4f}, "
