@@ -876,6 +876,37 @@ def main():
             "or legacy ell_err_traj."
         )
 
+    # --------------------------------------------------------------
+    # Component trajectories for diagnostics / saved comparison artifact
+    # --------------------------------------------------------------
+    # A frozen final LE artifact contains these components explicitly.
+    # Load them even when the complete precomputed LE trajectory was used.
+    # For older precomputed artifacts that do not contain a component,
+    # keep a NaN placeholder rather than leaving a local variable undefined.
+    if "ell_err_traj" in le.files:
+        ell_err = np.asarray(
+            le["ell_err_traj"],
+            dtype=np.float64,
+        )
+    elif "ell_err" not in locals():
+        ell_err = np.full_like(
+            le_gie,
+            np.nan,
+            dtype=np.float64,
+        )
+
+    if "id_gie_traj" in le.files:
+        id_gie = np.asarray(
+            le["id_gie_traj"],
+            dtype=np.float64,
+        )
+    elif "id_gie" not in locals():
+        id_gie = np.full_like(
+            le_gie,
+            np.nan,
+            dtype=np.float64,
+        )
+
     # Primary comparison begins when CKL and LE-GIE are both available.
     finite_ckl_by_t = np.any(
         np.isfinite(ckl_raw),
