@@ -93,21 +93,25 @@ def parse_args():
 
 
 def build_class_mean_reference(loss, labels, num_classes):
-    x = np.asarray(loss, dtype=np.float64)
+    """Return compact observed-class mean trajectories with shape C x T."""
+    x = np.asarray(loss)
     labels = np.asarray(labels, dtype=np.int64)
 
-    G = np.full_like(x, np.nan, dtype=np.float64)
+    T = x.shape[1]
+    Gc = np.full((int(num_classes), T), np.nan, dtype=np.float32)
 
     for c in range(int(num_classes)):
         members = np.flatnonzero(labels == c)
         if members.size == 0:
             continue
         with np.errstate(invalid="ignore"):
-            ref = np.nanmean(x[members], axis=0)
-        G[members] = ref[None, :]
+            Gc[c] = np.nanmean(
+                x[members],
+                axis=0,
+                dtype=np.float64,
+            ).astype(np.float32)
 
-    return G
-
+    return Gc
 
 def last3_limit(traj, t):
     return np.mean(
@@ -230,88 +234,90 @@ def rolling_le_variant(
     gie_limit_method,
     num_classes,
 ):
-    """K=40 LE with GIE always using last3 mean.
+    """Compute LE trajectory with low peak memory.
 
-    At output epoch t:
-        boundary = x[t-K-1]
-        tail     = x[t-K:t]  (K points, ending at x[t-1])
+    Fixed for every variant:
+        ell_err limit = next sample
 
-    Error component:
-        sample limit = next
+    Tested inside GIE:
+        last3_mean versus next
 
-    GIE:
-        gie_limit_method = last3_mean OR next
-        same rule applied to sample and class-reference limits
+    The observed-class reference is stored only once per class (C x T),
+    not repeated for all N samples.
     """
-    x = np.asarray(loss, dtype=np.float64)
+    x = np.asarray(loss, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int64)
 
     N, T = x.shape
-    G = build_class_mean_reference(
+    Gc = build_class_mean_reference(
         x,
         labels,
         num_classes,
     )
 
-    ell_err_traj = np.full((N, T), np.nan)
-    id_gie_traj = np.full((N, T), np.nan)
-    le_traj = np.full((N, T), np.nan)
+    # Only the final LE trajectory is retained.
+    le_traj = np.full((N, T), np.nan, dtype=np.float32)
 
     inv_j = 1.0 / np.arange(1, K + 1, dtype=np.float64)
-
     first_col = K + 1
+    batch_size = 2000
 
     for t in range(first_col, T):
         boundary = t - K - 1
         tail_start = t - K
 
-        # Error component is fixed at next-sample L.
-        L_err = next_limit(x, t)
+        # Error component is always next-sample L.
+        L_err = np.asarray(x[:, t], dtype=np.float32)
 
-        # Only GIE limit choice changes.
         if gie_limit_method == "last3_mean":
-            L_gie_sample = last3_limit(x, t)
-            L_gie_ref = last3_limit(G, t)
+            L_gie_sample = np.mean(
+                x[:, t - 2:t + 1],
+                axis=1,
+                dtype=np.float64,
+            ).astype(np.float32)
+            G_limit_by_class = np.mean(
+                Gc[:, t - 2:t + 1],
+                axis=1,
+                dtype=np.float64,
+            ).astype(np.float32)
         elif gie_limit_method == "next":
-            L_gie_sample = next_limit(x, t)
-            L_gie_ref = next_limit(G, t)
+            L_gie_sample = np.asarray(x[:, t], dtype=np.float32)
+            G_limit_by_class = np.asarray(Gc[:, t], dtype=np.float32)
         else:
             raise ValueError(gie_limit_method)
 
-        tail = x[:, tail_start:t]
-        G_tail = G[:, tail_start:t]
-
-        # ----------------------------------------
-        # ell_err with its own tested L_err.
-        # ----------------------------------------
-        ell_err = np.full(N, np.nan, dtype=np.float64)
-        valid_err = np.zeros(N, dtype=bool)
-
-        batch_size = 2000
+        # Process samples in batches and write LE directly.
         for lo in range(0, N, batch_size):
             hi = min(lo + batch_size, N)
 
-            Lb = np.asarray(L_err[lo:hi], dtype=np.float64)
-            r0b = np.abs(
-                np.asarray(x[lo:hi, boundary], dtype=np.float64) - Lb
+            xb = np.asarray(
+                x[lo:hi, tail_start:t],
+                dtype=np.float64,
             )
-            rjb = np.abs(
-                np.asarray(tail[lo:hi], dtype=np.float64)
-                - Lb[:, None]
+            boundary_b = np.asarray(
+                x[lo:hi, boundary],
+                dtype=np.float64,
+            )
+            Lerr_b = np.asarray(
+                L_err[lo:hi],
+                dtype=np.float64,
             )
 
-            vb = (
-                np.isfinite(Lb)
-                & np.isfinite(r0b)
-                & (r0b != 0.0)
+            r0 = np.abs(boundary_b - Lerr_b)
+            rj = np.abs(xb - Lerr_b[:, None])
+
+            valid_err = (
+                np.isfinite(Lerr_b)
+                & np.isfinite(r0)
+                & (r0 != 0.0)
                 & np.all(
-                    np.isfinite(rjb) & (rjb != 0.0),
+                    np.isfinite(rj) & (rj != 0.0),
                     axis=1,
                 )
             )
-            valid_err[lo:hi] = vb
 
-            if np.any(vb):
+            ell_err = np.full(hi - lo, np.nan, dtype=np.float64)
+            if np.any(valid_err):
                 with np.errstate(
                     divide="ignore",
                     invalid="ignore",
@@ -319,56 +325,63 @@ def rolling_le_variant(
                 ):
                     vals = (
                         np.log(
-                            rjb[vb]
-                            / r0b[vb, None]
+                            rj[valid_err]
+                            / r0[valid_err, None]
                         )
                         * inv_j[None, :]
                     )
+                ell_err[valid_err] = np.mean(vals, axis=1)
 
-                block = np.full(hi - lo, np.nan, dtype=np.float64)
-                block[vb] = np.mean(vals, axis=1)
-                ell_err[lo:hi] = block
+            labels_b = labels[lo:hi]
+            G_tail_b = np.asarray(
+                Gc[labels_b, tail_start:t],
+                dtype=np.float64,
+            )
+            Lgie_b = np.asarray(
+                L_gie_sample[lo:hi],
+                dtype=np.float64,
+            )
+            G_limit_b = np.asarray(
+                G_limit_by_class[labels_b],
+                dtype=np.float64,
+            )
 
-        # ----------------------------------------
-        # GIE always with stable last3 limits.
-        # ----------------------------------------
-        id_gie = vectorized_gie_window_with_limits(
-            tail,
-            G_tail,
-            L_gie_sample,
-            L_gie_ref,
-        )
+            id_gie = vectorized_gie_window_with_limits(
+                xb,
+                G_tail_b,
+                Lgie_b,
+                G_limit_b,
+                batch_size=hi - lo,
+            )
 
-        with np.errstate(
-            divide="ignore",
-            invalid="ignore",
-            over="ignore",
-        ):
-            le = ell_err + np.log(np.abs(id_gie))
+            with np.errstate(
+                divide="ignore",
+                invalid="ignore",
+                over="ignore",
+            ):
+                le = ell_err + np.log(np.abs(id_gie))
 
-        valid = (
-            valid_err
-            & np.isfinite(id_gie)
-            & (id_gie != 0.0)
-            & np.isfinite(le)
-        )
+            valid = (
+                valid_err
+                & np.isfinite(id_gie)
+                & (id_gie != 0.0)
+                & np.isfinite(le)
+            )
 
-        ell_err_traj[valid, t] = ell_err[valid]
-        id_gie_traj[valid, t] = id_gie[valid]
-        le_traj[valid, t] = le[valid]
+            if np.any(valid):
+                block = np.full(hi - lo, np.nan, dtype=np.float32)
+                block[valid] = le[valid].astype(np.float32)
+                le_traj[lo:hi, t] = block
 
     return {
         "le_traj": le_traj,
-        "ell_err_traj": ell_err_traj,
-        "id_gie_traj": id_gie_traj,
         "first_available_column": first_col,
         "first_available_epoch": first_col + 1,
     }
 
-
 def auc_binary(y, score):
     y = np.asarray(y, dtype=bool)
-    score = np.asarray(score, dtype=np.float64)
+    score = np.asarray(score)
 
     finite = np.isfinite(score)
     if np.sum(finite) < 2:
@@ -401,7 +414,7 @@ def best_auc(auc, epochs):
 
 
 def temporal_stability(score_nt, start_col):
-    x = np.asarray(score_nt[:, start_col:], dtype=np.float64)
+    x = np.asarray(score_nt[:, start_col:])
 
     a = x[:, :-1]
     b = x[:, 1:]
@@ -508,8 +521,6 @@ def evaluate(
     target_fpr,
 ):
     le = result["le_traj"]
-    ell_err = result["ell_err_traj"]
-    id_gie = result["id_gie_traj"]
     start_col = int(result["first_available_column"])
 
     z_tn = standardize_monitoring_score(
@@ -523,17 +534,8 @@ def evaluate(
 
     raw_auc = auc_curve(y, le)
     z_auc = auc_curve(y, z_nt)
-    err_auc = auc_curve(y, ell_err)
-
-    log_m = np.full_like(id_gie, np.nan)
-    valid_m = np.isfinite(id_gie) & (id_gie != 0.0)
-    log_m[valid_m] = np.log(np.abs(id_gie[valid_m]))
-    m_auc = auc_curve(y, log_m)
-
     raw_best, raw_ep, _ = best_auc(raw_auc, epochs)
     z_best, z_ep, _ = best_auc(z_auc, epochs)
-    err_best, err_ep, _ = best_auc(err_auc, epochs)
-    m_best, m_ep, _ = best_auc(m_auc, epochs)
 
     pair = exact_pairwise_scores_by_class(
         le,
@@ -543,7 +545,6 @@ def evaluate(
 
     pair_score = np.asarray(
         pair["cumulative_score"],
-        dtype=np.float64,
     )
 
     pair_auc = auc_curve(y, pair_score)
@@ -609,17 +610,13 @@ def evaluate(
         "K": K,
         "err_limit_method": "next",
         "gie_limit_method":
-            "next" if name == "err_next__gie_next"
+            "next" if "err_next__gie_next" in name
             else "last3_mean",
         "reference_method": "mean",
         "raw_le_best_auc": raw_best,
         "raw_le_best_epoch": raw_ep,
         "z_le_best_auc": z_best,
         "z_le_best_epoch": z_ep,
-        "ell_err_best_auc": err_best,
-        "ell_err_best_epoch": err_ep,
-        "log_abs_gie_best_auc": m_best,
-        "log_abs_gie_best_epoch": m_ep,
         "pairwise_best_auc": pair_best,
         "pairwise_best_epoch": pair_ep,
         "le_median_abs_epoch_step":
@@ -646,7 +643,7 @@ def main():
 
     d = np.load(args.common_npz, allow_pickle=False)
 
-    loss = np.asarray(d["loss_traj"], dtype=np.float64)
+    loss = np.asarray(d["loss_traj"], dtype=np.float32)
     labels = np.asarray(d["observed_label"], dtype=np.int64)
     y = np.asarray(d["is_anomaly"], dtype=bool)
     epochs = np.asarray(d["epoch"], dtype=np.int64)
@@ -689,8 +686,6 @@ def main():
             summary_rows.append(summary)
             all_topq.extend(topq)
             pair_auc_by_variant[name] = pair_auc
-            saved_arrays[f"le_{base_name}_K{K}"] = result["le_traj"].astype(np.float32)
-            saved_arrays[f"id_gie_{gie_method}_K{K}"] = result["id_gie_traj"].astype(np.float32)
 
             print(
                 f"{name:>30s} | "
@@ -715,11 +710,6 @@ def main():
     write_csv(
         args.output_dir / "gie_limit_k_sweep_topq.csv",
         all_topq,
-    )
-
-    np.savez_compressed(
-        args.output_dir / "gie_limit_k_sweep_score_trajectories.npz",
-        **saved_arrays,
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -765,7 +755,7 @@ def main():
         ],
         "target_fpr": float(args.target_fpr),
         "production_modules_modified": False,
-        "memory_mode": "sample-batched GIE and ell_err; full per-variant trajectories released after evaluation",
+        "memory_mode": "float32 loss + compact class reference + one float32 LE trajectory + sample batching; component trajectories not retained",
         "purpose":
             "test next-sample versus last-three-mean L inside GIE across K while ell_err remains fixed at next-sample L",
         "selection_warning":
