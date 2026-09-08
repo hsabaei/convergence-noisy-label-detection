@@ -125,88 +125,102 @@ def vectorized_gie_window_with_limits(
     G,
     phi_limit,
     G_limit,
+    batch_size=2000,
 ):
-    """Same row-wise GIE/Hill formula used in the prior corrected study."""
-    phi = np.asarray(phi, dtype=np.float64)
-    G = np.asarray(G, dtype=np.float64)
-    phi_limit = np.asarray(phi_limit, dtype=np.float64)
-    G_limit = np.asarray(G_limit, dtype=np.float64)
+    """Row-wise GIE/Hill formula evaluated in sample batches.
 
-    N, _ = phi.shape
+    Batching preserves the estimator exactly while avoiding simultaneous
+    N x K temporary arrays for R, FR, mask, log_num, and log_den.
+    """
+    phi = np.asarray(phi)
+    G = np.asarray(G)
+    phi_limit = np.asarray(phi_limit)
+    G_limit = np.asarray(G_limit)
 
-    R = np.abs(phi - phi_limit[:, None])
-    FR = np.abs(G - G_limit[:, None])
-
-    with np.errstate(invalid="ignore"):
-        w0 = np.max(R, axis=1)
-        w1 = np.max(FR, axis=1)
-
+    N = phi.shape[0]
     d = np.full(N, np.nan, dtype=np.float64)
 
-    mask = (
-        (R > EPS)
-        & (FR > EPS)
-        & np.isfinite(R)
-        & np.isfinite(FR)
-    )
+    for lo in range(0, N, int(batch_size)):
+        hi = min(lo + int(batch_size), N)
 
-    n_nonzero = mask.sum(axis=1)
-    k_internal = n_nonzero - 1
+        p = np.asarray(phi[lo:hi], dtype=np.float64)
+        g = np.asarray(G[lo:hi], dtype=np.float64)
+        pl = np.asarray(phi_limit[lo:hi], dtype=np.float64)
+        gl = np.asarray(G_limit[lo:hi], dtype=np.float64)
 
-    base_ok = (
-        (k_internal > 4)
-        & np.isfinite(w0)
-        & np.isfinite(w1)
-        & (w0 > 0.0)
-        & (w1 > 0.0)
-    )
+        R = np.abs(p - pl[:, None])
+        FR = np.abs(g - gl[:, None])
 
-    safe_w0 = np.where(base_ok, w0 + EPS, 1.0)
-    safe_w1 = np.where(base_ok, w1 + EPS, 1.0)
+        with np.errstate(invalid="ignore"):
+            w0 = np.max(R, axis=1)
+            w1 = np.max(FR, axis=1)
 
-    with np.errstate(
-        divide="ignore",
-        invalid="ignore",
-        over="ignore",
-    ):
-        log_num = np.where(
-            mask,
-            np.log(np.abs(R / safe_w0[:, None])),
-            0.0,
-        )
-        log_den = np.where(
-            mask,
-            np.log(np.abs(FR / safe_w1[:, None])),
-            0.0,
+        mask = (
+            (R > EPS)
+            & (FR > EPS)
+            & np.isfinite(R)
+            & np.isfinite(FR)
         )
 
-    denom_num = np.sum(log_num, axis=1)
-    denom_den = np.sum(log_den, axis=1)
+        n_nonzero = mask.sum(axis=1)
+        k_internal = n_nonzero - 1
 
-    ok = (
-        base_ok
-        & np.isfinite(denom_num)
-        & np.isfinite(denom_den)
-        & (np.abs(denom_num) >= EPS)
-        & (np.abs(denom_den) >= EPS)
-    )
+        base_ok = (
+            (k_internal > 4)
+            & np.isfinite(w0)
+            & np.isfinite(w1)
+            & (w0 > 0.0)
+            & (w1 > 0.0)
+        )
 
-    hill_num = np.full(N, np.nan)
-    hill_den = np.full(N, np.nan)
+        safe_w0 = np.where(base_ok, w0 + EPS, 1.0)
+        safe_w1 = np.where(base_ok, w1 + EPS, 1.0)
 
-    hill_num[ok] = -k_internal[ok] / denom_num[ok]
-    hill_den[ok] = -k_internal[ok] / denom_den[ok]
+        with np.errstate(
+            divide="ignore",
+            invalid="ignore",
+            over="ignore",
+        ):
+            log_num = np.where(
+                mask,
+                np.log(np.abs(R / safe_w0[:, None])),
+                0.0,
+            )
+            log_den = np.where(
+                mask,
+                np.log(np.abs(FR / safe_w1[:, None])),
+                0.0,
+            )
 
-    good = (
-        ok
-        & np.isfinite(hill_num)
-        & np.isfinite(hill_den)
-        & (np.abs(hill_den) > EPS)
-    )
+        denom_num = np.sum(log_num, axis=1)
+        denom_den = np.sum(log_den, axis=1)
 
-    d[good] = hill_num[good] / hill_den[good]
+        ok = (
+            base_ok
+            & np.isfinite(denom_num)
+            & np.isfinite(denom_den)
+            & (np.abs(denom_num) >= EPS)
+            & (np.abs(denom_den) >= EPS)
+        )
+
+        hill_num = np.full(hi - lo, np.nan, dtype=np.float64)
+        hill_den = np.full(hi - lo, np.nan, dtype=np.float64)
+
+        hill_num[ok] = -k_internal[ok] / denom_num[ok]
+        hill_den[ok] = -k_internal[ok] / denom_den[ok]
+
+        good = (
+            ok
+            & np.isfinite(hill_num)
+            & np.isfinite(hill_den)
+            & (np.abs(hill_den) > EPS)
+        )
+
+        out = np.full(hi - lo, np.nan, dtype=np.float64)
+        out[good] = hill_num[good] / hill_den[good]
+        d[lo:hi] = out
+
     return d
-
 
 def rolling_le_variant(
     loss,
@@ -242,9 +256,6 @@ def rolling_le_variant(
     ell_err_traj = np.full((N, T), np.nan)
     id_gie_traj = np.full((N, T), np.nan)
     le_traj = np.full((N, T), np.nan)
-    err_limit_traj = np.full((N, T), np.nan)
-    gie_sample_limit_traj = np.full((N, T), np.nan)
-    gie_reference_limit_traj = np.full((N, T), np.nan)
 
     inv_j = 1.0 / np.arange(1, K + 1, dtype=np.float64)
 
@@ -267,50 +278,56 @@ def rolling_le_variant(
         else:
             raise ValueError(gie_limit_method)
 
-        err_limit_traj[:, t] = L_err
-        gie_sample_limit_traj[:, t] = L_gie_sample
-        gie_reference_limit_traj[:, t] = L_gie_ref
-
         tail = x[:, tail_start:t]
         G_tail = G[:, tail_start:t]
 
         # ----------------------------------------
         # ell_err with its own tested L_err.
         # ----------------------------------------
-        r0 = np.abs(x[:, boundary] - L_err)
-        rj = np.abs(tail - L_err[:, None])
+        ell_err = np.full(N, np.nan, dtype=np.float64)
+        valid_err = np.zeros(N, dtype=bool)
 
-        valid_err = (
-            np.isfinite(L_err)
-            & np.isfinite(r0)
-            & (r0 != 0.0)
-            & np.all(
-                np.isfinite(rj)
-                & (rj != 0.0),
-                axis=1,
+        batch_size = 2000
+        for lo in range(0, N, batch_size):
+            hi = min(lo + batch_size, N)
+
+            Lb = np.asarray(L_err[lo:hi], dtype=np.float64)
+            r0b = np.abs(
+                np.asarray(x[lo:hi, boundary], dtype=np.float64) - Lb
             )
-        )
+            rjb = np.abs(
+                np.asarray(tail[lo:hi], dtype=np.float64)
+                - Lb[:, None]
+            )
 
-        ell_err = np.full(N, np.nan)
-
-        if np.any(valid_err):
-            with np.errstate(
-                divide="ignore",
-                invalid="ignore",
-                over="ignore",
-            ):
-                vals = (
-                    np.log(
-                        rj[valid_err]
-                        / r0[valid_err, None]
-                    )
-                    * inv_j[None, :]
+            vb = (
+                np.isfinite(Lb)
+                & np.isfinite(r0b)
+                & (r0b != 0.0)
+                & np.all(
+                    np.isfinite(rjb) & (rjb != 0.0),
+                    axis=1,
                 )
-
-            ell_err[valid_err] = np.mean(
-                vals,
-                axis=1,
             )
+            valid_err[lo:hi] = vb
+
+            if np.any(vb):
+                with np.errstate(
+                    divide="ignore",
+                    invalid="ignore",
+                    over="ignore",
+                ):
+                    vals = (
+                        np.log(
+                            rjb[vb]
+                            / r0b[vb, None]
+                        )
+                        * inv_j[None, :]
+                    )
+
+                block = np.full(hi - lo, np.nan, dtype=np.float64)
+                block[vb] = np.mean(vals, axis=1)
+                ell_err[lo:hi] = block
 
         # ----------------------------------------
         # GIE always with stable last3 limits.
@@ -344,9 +361,6 @@ def rolling_le_variant(
         "le_traj": le_traj,
         "ell_err_traj": ell_err_traj,
         "id_gie_traj": id_gie_traj,
-        "err_limit_traj": err_limit_traj,
-        "gie_sample_limit_traj": gie_sample_limit_traj,
-        "gie_reference_limit_traj": gie_reference_limit_traj,
         "first_available_column": first_col,
         "first_available_epoch": first_col + 1,
     }
@@ -640,11 +654,6 @@ def main():
     summary_rows = []
     all_topq = []
     pair_auc_by_variant = {}
-    saved_arrays = {
-        "epoch": epochs,
-        "observed_label": labels,
-        "is_anomaly": y,
-    }
 
     for K in args.K_values:
         if K < 2:
@@ -694,6 +703,9 @@ def main():
                 f"TPR={summary['best_tested_q_TPR']:.4f} "
                 f"FPR={summary['best_tested_q_FPR']:.4f}"
             )
+            del result
+            import gc
+            gc.collect()
 
     write_csv(
         args.output_dir / "gie_limit_k_sweep_summary.csv",
@@ -753,6 +765,7 @@ def main():
         ],
         "target_fpr": float(args.target_fpr),
         "production_modules_modified": False,
+        "memory_mode": "sample-batched GIE and ell_err; full per-variant trajectories released after evaluation",
         "purpose":
             "test next-sample versus last-three-mean L inside GIE across K while ell_err remains fixed at next-sample L",
         "selection_warning":
