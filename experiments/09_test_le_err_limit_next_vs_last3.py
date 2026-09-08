@@ -6,8 +6,7 @@ Goal
 ----
 Keep the GIE construction fixed at the user's stabilised choice:
 
-    K = 40
-    GIE sample/reference limits = mean of latest 3 observations
+        GIE sample/reference limits = mean of latest 3 observations
     class reference = observed-class mean
 
 Change ONLY the finite-sample limit used by the error-decay component:
@@ -56,7 +55,6 @@ from convergence_monitoring.framework import (
 
 
 EPS = 1e-7
-K = 40
 
 
 def parse_args():
@@ -72,6 +70,13 @@ def parse_args():
     )
     p.add_argument("--num-classes", type=int, default=10)
     p.add_argument(
+        "--K-values",
+        type=int,
+        nargs="+",
+        default=(10, 15, 20, 30, 40),
+        help="K values to test for both error-limit variants.",
+    )
+    p.add_argument(
         "--top-fractions",
         type=float,
         nargs="+",
@@ -82,7 +87,7 @@ def parse_args():
         "--output-dir",
         type=Path,
         default=Path(
-            "results/le_err_limit_sensitivity_k40"
+            "results/le_err_limit_k_sweep"
         ),
     )
 
@@ -218,6 +223,7 @@ def rolling_le_variant(
     loss,
     labels,
     *,
+    K,
     err_limit_method,
     num_classes,
 ):
@@ -488,6 +494,7 @@ def evaluate(
     name,
     result,
     *,
+    K,
     labels,
     y,
     epochs,
@@ -639,153 +646,177 @@ def main():
     y = np.asarray(d["is_anomaly"], dtype=bool)
     epochs = np.asarray(d["epoch"], dtype=np.int64)
 
-    variants = {}
-
-    for err_method in ("last3_mean", "next"):
-        name = (
-            "err_last3__gie_last3"
-            if err_method == "last3_mean"
-            else "err_next__gie_last3"
-        )
-
-        print(
-            f"Computing {name}: "
-            f"K={K}, err_limit={err_method}, "
-            "GIE_limit=last3_mean ..."
-        )
-
-        variants[name] = rolling_le_variant(
-            loss,
-            labels,
-            err_limit_method=err_method,
-            num_classes=args.num_classes,
-        )
-
     summary_rows = []
     all_topq = []
     pair_auc_by_variant = {}
+    saved_arrays = {
+        "epoch": epochs,
+        "observed_label": labels,
+        "is_anomaly": y,
+    }
 
-    for name, result in variants.items():
-        summary, topq, pair_auc = evaluate(
-            name,
-            result,
-            labels=labels,
-            y=y,
-            epochs=epochs,
-            num_classes=args.num_classes,
-            top_fractions=args.top_fractions,
-            target_fpr=args.target_fpr,
-        )
+    for K in args.K_values:
+        if K < 2:
+            raise ValueError(f"K must be >= 2, got {K}")
 
-        summary_rows.append(summary)
-        all_topq.extend(topq)
-        pair_auc_by_variant[name] = pair_auc
+        for err_method in ("last3_mean", "next"):
+            base_name = (
+                "err_last3__gie_last3"
+                if err_method == "last3_mean"
+                else "err_next__gie_last3"
+            )
+            name = f"{base_name}__K{K}"
 
-        print(
-            f"{name:>24s} | "
-            f"raw={summary['raw_le_best_auc']:.6f} "
-            f"z={summary['z_le_best_auc']:.6f} "
-            f"pair={summary['pairwise_best_auc']:.6f} "
-            f"| dLE50={summary['le_median_abs_epoch_step']:.6g} "
-            f"dLE95={summary['le_p95_abs_epoch_step']:.6g} "
-            f"| best tested q={summary['best_tested_q']:.2f} "
-            f"TPR={summary['best_tested_q_TPR']:.4f} "
-            f"FPR={summary['best_tested_q_FPR']:.4f}"
-        )
+            print(
+                f"Computing {name}: "
+                f"K={K}, err_limit={err_method}, "
+                "GIE_limit=last3_mean ..."
+            )
+
+            result = rolling_le_variant(
+                loss,
+                labels,
+                K=K,
+                err_limit_method=err_method,
+                num_classes=args.num_classes,
+            )
+
+            summary, topq, pair_auc = evaluate(
+                name,
+                result,
+                K=K,
+                labels=labels,
+                y=y,
+                epochs=epochs,
+                num_classes=args.num_classes,
+                top_fractions=args.top_fractions,
+                target_fpr=args.target_fpr,
+            )
+
+            summary["variant_base"] = base_name
+            summary_rows.append(summary)
+            all_topq.extend(topq)
+            pair_auc_by_variant[name] = pair_auc
+
+            saved_arrays[f"le_{base_name}_K{K}"] = (
+                result["le_traj"].astype(np.float32)
+            )
+            saved_arrays[f"ell_err_{err_method}_K{K}"] = (
+                result["ell_err_traj"].astype(np.float32)
+            )
+
+            print(
+                f"{name:>30s} | "
+                f"raw={summary['raw_le_best_auc']:.6f} "
+                f"z={summary['z_le_best_auc']:.6f} "
+                f"pair={summary['pairwise_best_auc']:.6f} "
+                f"| dLE50={summary['le_median_abs_epoch_step']:.6g} "
+                f"dLE95={summary['le_p95_abs_epoch_step']:.6g} "
+                f"| best tested q={summary['best_tested_q']:.2f} "
+                f"TPR={summary['best_tested_q_TPR']:.4f} "
+                f"FPR={summary['best_tested_q_FPR']:.4f}"
+            )
 
     write_csv(
-        args.output_dir / "err_limit_sensitivity_summary.csv",
+        args.output_dir / "err_limit_k_sweep_summary.csv",
         summary_rows,
     )
 
     write_csv(
-        args.output_dir / "err_limit_sensitivity_topq.csv",
+        args.output_dir / "err_limit_k_sweep_topq.csv",
         all_topq,
     )
 
-    # Save both score trajectories for direct inspection if desired.
+    # Save all score trajectories for direct inspection if desired.
     np.savez_compressed(
-        args.output_dir / "err_limit_sensitivity_score_trajectories.npz",
-        epoch=epochs,
-        observed_label=labels,
-        is_anomaly=y,
-        le_err_last3_gie_last3=variants[
-            "err_last3__gie_last3"
-        ]["le_traj"].astype(np.float32),
-        le_err_next_gie_last3=variants[
-            "err_next__gie_last3"
-        ]["le_traj"].astype(np.float32),
-        ell_err_last3=variants[
-            "err_last3__gie_last3"
-        ]["ell_err_traj"].astype(np.float32),
-        ell_err_next=variants[
-            "err_next__gie_last3"
-        ]["ell_err_traj"].astype(np.float32),
-        id_gie_last3=variants[
-            "err_last3__gie_last3"
-        ]["id_gie_traj"].astype(np.float32),
+        args.output_dir / "err_limit_k_sweep_score_trajectories.npz",
+        **saved_arrays,
     )
 
-    # Plot cumulative pairwise AUC.
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-
-    for name, auc in pair_auc_by_variant.items():
-        ax.plot(
-            epochs,
-            auc,
-            label=name,
+    # Pairwise best AUC vs K.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for base_name in (
+        "err_last3__gie_last3",
+        "err_next__gie_last3",
+    ):
+        rr = sorted(
+            [r for r in summary_rows if r["variant_base"] == base_name],
+            key=lambda r: int(r["K"]),
         )
-
-    ax.axhline(0.5, linewidth=1)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Cumulative pairwise ROC-AUC")
-    ax.set_ylim(0.5, 1.0)
-    ax.set_title(
-        "LE-GIE: error-limit sensitivity with GIE fixed at last3"
-    )
+        ax.plot(
+            [int(r["K"]) for r in rr],
+            [float(r["pairwise_best_auc"]) for r in rr],
+            marker="o",
+            label=base_name,
+        )
+    ax.set_xlabel("K")
+    ax.set_ylabel("Best cumulative pairwise ROC-AUC")
+    ax.set_title("LE-GIE pairwise AUC vs K")
     ax.legend()
     fig.tight_layout()
     fig.savefig(
-        args.output_dir / "fig_err_limit_pairwise_auc.png",
+        args.output_dir / "fig_pairwise_best_auc_vs_K.png",
         dpi=180,
     )
     plt.close(fig)
 
-    # Stability comparison.
-    labels_plot = [
-        r["variant"]
-        for r in summary_rows
-    ]
-    med = [
-        r["le_median_abs_epoch_step"]
-        for r in summary_rows
-    ]
-    p95 = [
-        r["le_p95_abs_epoch_step"]
-        for r in summary_rows
-    ]
-
-    xloc = np.arange(len(summary_rows), dtype=float)
-    width = 0.35
-
+    # Best TPR under FPR budget vs K.
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(xloc - width/2, med, width, label="Median |ΔLE|")
-    ax.bar(xloc + width/2, p95, width, label="95th percentile |ΔLE|")
-    ax.set_xticks(xloc)
-    ax.set_xticklabels(labels_plot)
-    ax.set_ylabel("Absolute epoch-to-epoch LE change")
-    ax.set_title("LE stability: next vs last3 only in error component")
+    for base_name in (
+        "err_last3__gie_last3",
+        "err_next__gie_last3",
+    ):
+        rr = sorted(
+            [r for r in summary_rows if r["variant_base"] == base_name],
+            key=lambda r: int(r["K"]),
+        )
+        ax.plot(
+            [int(r["K"]) for r in rr],
+            [float(r["best_tested_q_TPR"]) for r in rr],
+            marker="o",
+            label=base_name,
+        )
+    ax.set_xlabel("K")
+    ax.set_ylabel("Best tested TPR under FPR <= target")
+    ax.set_title("LE-GIE best low-FPR detection vs K")
     ax.legend()
     fig.tight_layout()
     fig.savefig(
-        args.output_dir / "fig_err_limit_stability.png",
+        args.output_dir / "fig_best_tpr_vs_K.png",
+        dpi=180,
+    )
+    plt.close(fig)
+
+    # Stability vs K.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for base_name in (
+        "err_last3__gie_last3",
+        "err_next__gie_last3",
+    ):
+        rr = sorted(
+            [r for r in summary_rows if r["variant_base"] == base_name],
+            key=lambda r: int(r["K"]),
+        )
+        ax.plot(
+            [int(r["K"]) for r in rr],
+            [float(r["le_median_abs_epoch_step"]) for r in rr],
+            marker="o",
+            label=f"{base_name} median",
+        )
+    ax.set_xlabel("K")
+    ax.set_ylabel("Median |ΔLE|")
+    ax.set_title("LE temporal stability vs K")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        args.output_dir / "fig_median_step_vs_K.png",
         dpi=180,
     )
     plt.close(fig)
 
     config = {
-        "artifact": "LE_error_limit_sensitivity_K40",
-        "K": K,
+        "artifact": "LE_error_limit_sensitivity_K_sweep",
+        "K_values": [int(k) for k in args.K_values],
         "theoretical_estimator":
             "ell_hat = ell_err_hat + log(abs(m_GIE_hat))",
         "reference_method": "mean",
@@ -801,19 +832,19 @@ def main():
         "target_fpr": float(args.target_fpr),
         "production_modules_modified": False,
         "purpose":
-            "test whether next-sample L for ell_err improves LE while GIE retains last3 stability",
+            "test next-sample vs last3 L for ell_err across K while GIE retains last3 stability",
         "selection_warning":
             "Exploratory labeled-run comparison; freeze chosen variant before independent validation.",
     }
 
     with (
-        args.output_dir / "err_limit_sensitivity_config.json"
+        args.output_dir / "err_limit_k_sweep_config.json"
     ).open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
     print()
     print(
-        "Done. GIE remained fixed at last3_mean for BOTH variants."
+        "Done. GIE remained fixed at last3_mean for ALL K values and BOTH variants."
     )
     print(
         f"Outputs: {args.output_dir}"
