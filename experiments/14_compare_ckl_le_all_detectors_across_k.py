@@ -76,7 +76,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from convergence_monitoring.detectors import exact_pairwise_scores_by_class
+from convergence_monitoring.detectors import exact_pairwise_scores_by_class, binary_auc_from_scores
 from convergence_monitoring.framework import standardize_monitoring_score
 
 P11 = ROOT / "experiments" / "11_compare_ckl_vs_le_across_k.py"
@@ -408,6 +408,31 @@ def best_over_epoch(rows, target_fpr=None):
     return dict(group[0])
 
 
+def auc_binary(y, score):
+    y = np.asarray(y, dtype=bool)
+    score = np.asarray(score)
+    finite = np.isfinite(score)
+    if np.sum(finite) < 2:
+        return np.nan
+    yy = y[finite]
+    if np.all(yy) or np.all(~yy):
+        return np.nan
+    return float(binary_auc_from_scores(score[finite & y], score[finite & ~y]))
+
+def auc_curve(y, score_nt, start_col):
+    out = np.full(score_nt.shape[1], np.nan, dtype=np.float64)
+    for t in range(start_col, score_nt.shape[1]):
+        out[t] = auc_binary(y, score_nt[:, t])
+    return out
+
+def best_auc(auc, epochs):
+    finite = np.flatnonzero(np.isfinite(auc))
+    if finite.size == 0:
+        return {"best_auc": np.nan, "best_epoch": -1}
+    t = int(finite[np.argmax(auc[finite])])
+    return {"best_auc": float(auc[t]), "best_epoch": int(epochs[t])}
+
+
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -427,6 +452,7 @@ def main():
 
     # Store all score trajectories only one K at a time.
     per_k = {}
+    auc_rows = []
 
     for K in args.K_values:
         print()
@@ -501,6 +527,40 @@ def main():
             le_pair["cumulative_score"]
         )[:, start_col:]
 
+        # AUC summaries for raw score, class-z score, and cumulative pairwise.
+        ckl_raw_auc = auc_curve(y, ckl, start_col)
+        ckl_z_nt = np.asarray(z_full_tn.T, dtype=np.float32)
+        ckl_z_auc = auc_curve(y, ckl_z_nt, start_col)
+        ckl_pair_auc = auc_curve(y, np.asarray(ckl_pair["cumulative_score"]), start_col)
+
+        le_raw_auc = auc_curve(y, le, start_col)
+        le_z_full_tn = standardize_monitoring_score(
+            le.T, labels, direction="higher",
+            num_classes=args.num_classes, start_index=start_col,
+        )
+        le_z_nt = np.asarray(le_z_full_tn.T, dtype=np.float32)
+        le_z_auc = auc_curve(y, le_z_nt, start_col)
+        le_pair_auc = auc_curve(y, np.asarray(le_pair["cumulative_score"]), start_col)
+
+        for method, raw_auc, z_auc, pair_auc in (
+            ("CKL", ckl_raw_auc, ckl_z_auc, ckl_pair_auc),
+            ("LE_GIE", le_raw_auc, le_z_auc, le_pair_auc),
+        ):
+            rb = best_auc(raw_auc, epochs)
+            zb = best_auc(z_auc, epochs)
+            pb = best_auc(pair_auc, epochs)
+            auc_rows.append({
+                "method": method,
+                "K": int(K),
+                "common_start_epoch": int(epochs_analysis[0]),
+                "raw_best_auc": rb["best_auc"],
+                "raw_best_epoch": rb["best_epoch"],
+                "class_z_best_auc": zb["best_auc"],
+                "class_z_best_epoch": zb["best_epoch"],
+                "cumulative_pairwise_best_auc": pb["best_auc"],
+                "cumulative_pairwise_best_epoch": pb["best_epoch"],
+            })
+
         per_k[int(K)] = {
             "epochs_analysis": epochs_analysis,
             "T_monitor": int(T_monitor),
@@ -513,6 +573,11 @@ def main():
 
         del ckl, le
         gc.collect()
+
+    write_csv(
+        args.output_dir / "base_and_pairwise_auc_summary.csv",
+        auc_rows,
+    )
 
     # ============================================================
     # Select ONE common CKL tau across all K and all 3 detectors.
@@ -949,22 +1014,25 @@ def main():
     )
 
     # ============================================================
-    # Plots: TPR vs K for each detector, CKL vs LE
+    # PRIMARY plots:
+    # fixed detector parameters, no FPR filtering.
+    # FPR is shown as an evaluation outcome.
     # ============================================================
-    for detector in (
+    detectors = (
         "min_run",
         "sliding_window",
         "ewma",
         "cumulative_pairwise",
-    ):
-        fig, ax = plt.subplots(
-            figsize=(7.5, 5)
-        )
+    )
+
+    for detector in detectors:
+        # TPR vs K
+        fig, ax = plt.subplots(figsize=(7.5, 5))
 
         for method in ("CKL", "LE_GIE"):
             rr = sorted(
                 [
-                    r for r in benchmark_rows
+                    r for r in deployment_rows
                     if (
                         r["method"] == method
                         and r["detector"] == detector
@@ -981,21 +1049,204 @@ def main():
             )
 
         ax.set_xlabel("K")
-        ax.set_ylabel(
-            f"Best TPR under FPR <= {args.target_fpr}"
-        )
+        ax.set_ylabel("Best TPR with frozen detector parameters")
         ax.set_title(
-            f"CKL vs LE-GIE: {detector}"
+            f"Primary fixed-parameter comparison: {detector}"
         )
         ax.legend()
         fig.tight_layout()
 
         fig.savefig(
             args.output_dir
-            / f"fig_{detector}_tpr_vs_K.png",
+            / f"fig_primary_{detector}_tpr_vs_K.png",
             dpi=180,
         )
         plt.close(fig)
+
+        # FPR vs K
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+
+        for method in ("CKL", "LE_GIE"):
+            rr = sorted(
+                [
+                    r for r in deployment_rows
+                    if (
+                        r["method"] == method
+                        and r["detector"] == detector
+                    )
+                ],
+                key=lambda r: int(r["K"]),
+            )
+
+            ax.plot(
+                [int(r["K"]) for r in rr],
+                [float(r["FPR"]) for r in rr],
+                marker="o",
+                label=method,
+            )
+
+        ax.axhline(
+            args.target_fpr,
+            linestyle="--",
+            linewidth=1,
+            label=f"reference FPR={args.target_fpr}",
+        )
+        ax.set_xlabel("K")
+        ax.set_ylabel("Evaluation FPR")
+        ax.set_title(
+            f"Primary fixed-parameter FPR: {detector}"
+        )
+        ax.legend()
+        fig.tight_layout()
+
+        fig.savefig(
+            args.output_dir
+            / f"fig_primary_{detector}_fpr_vs_K.png",
+            dpi=180,
+        )
+        plt.close(fig)
+
+    # One compact primary summary at K=40.
+    k40_rows = [
+        r for r in deployment_rows
+        if int(r["K"]) == 40
+    ]
+
+    x = np.arange(len(detectors), dtype=float)
+    width = 0.36
+
+    ckl40 = {
+        r["detector"]: r
+        for r in k40_rows
+        if r["method"] == "CKL"
+    }
+    le40 = {
+        r["detector"]: r
+        for r in k40_rows
+        if r["method"] == "LE_GIE"
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.bar(
+        x - width / 2,
+        [ckl40[d]["TPR"] for d in detectors],
+        width,
+        label="CKL",
+    )
+    ax.bar(
+        x + width / 2,
+        [le40[d]["TPR"] for d in detectors],
+        width,
+        label="LE-GIE",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(detectors, rotation=15)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("TPR")
+    ax.set_title("Primary frozen detector comparison at K=40")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        args.output_dir / "fig_primary_all_detectors_K40_tpr.png",
+        dpi=180,
+    )
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.bar(
+        x - width / 2,
+        [ckl40[d]["FPR"] for d in detectors],
+        width,
+        label="CKL",
+    )
+    ax.bar(
+        x + width / 2,
+        [le40[d]["FPR"] for d in detectors],
+        width,
+        label="LE-GIE",
+    )
+    ax.axhline(
+        args.target_fpr,
+        linestyle="--",
+        linewidth=1,
+        label=f"reference FPR={args.target_fpr}",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(detectors, rotation=15)
+    ax.set_ylabel("Evaluation FPR")
+    ax.set_title("Primary frozen detector FPR at K=40")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        args.output_dir / "fig_primary_all_detectors_K40_fpr.png",
+        dpi=180,
+    )
+    plt.close(fig)
+
+    # ============================================================
+    # SECONDARY benchmark plots:
+    # only rows feasible under FPR <= target.
+    # ============================================================
+    for detector in detectors:
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+
+        any_line = False
+        for method in ("CKL", "LE_GIE"):
+            rr = sorted(
+                [
+                    r for r in benchmark_rows
+                    if (
+                        r["method"] == method
+                        and r["detector"] == detector
+                    )
+                ],
+                key=lambda r: int(r["K"]),
+            )
+
+            if not rr:
+                continue
+
+            any_line = True
+            ax.plot(
+                [int(r["K"]) for r in rr],
+                [float(r["TPR"]) for r in rr],
+                marker="o",
+                label=method,
+            )
+
+        if any_line:
+            ax.set_xlabel("K")
+            ax.set_ylabel(
+                f"Best TPR under FPR <= {args.target_fpr}"
+            )
+            ax.set_title(
+                f"Secondary low-FPR benchmark: {detector}"
+            )
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(
+                args.output_dir
+                / f"fig_secondary_{detector}_tpr_vs_K.png",
+                dpi=180,
+            )
+        plt.close(fig)
+
+    # AUC comparison across K.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for method in ("CKL", "LE_GIE"):
+        rr = sorted([r for r in auc_rows if r["method"] == method], key=lambda r: int(r["K"]))
+        ax.plot(
+            [int(r["K"]) for r in rr],
+            [float(r["cumulative_pairwise_best_auc"]) for r in rr],
+            marker="o", label=method,
+        )
+    ax.set_xlabel("K")
+    ax.set_ylabel("Best cumulative pairwise ROC-AUC")
+    ax.set_title("CKL vs LE-GIE cumulative pairwise AUC across K")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(args.output_dir / "fig_auc_cumulative_pairwise_vs_K.png", dpi=180)
+    plt.close(fig)
 
     config = {
         "artifact":
@@ -1045,6 +1296,12 @@ def main():
             "pairwise_q":
                 float(args.q),
         },
+        "primary_summary":
+            "fixed detector parameters; best TPR over epoch; no FPR filtering; FPR reported only as benchmark outcome",
+        "secondary_summary":
+            "best TPR over epoch subject to FPR <= target_fpr_benchmark",
+        "auc_output":
+            "base_and_pairwise_auc_summary.csv contains raw, class-z, and cumulative-pairwise best ROC-AUC for each estimator and K",
         "target_fpr_benchmark":
             float(args.target_fpr),
         "selection_warning":
@@ -1082,8 +1339,20 @@ def main():
     )
     print()
 
+    print("PRIMARY fixed-parameter results (no FPR filtering):")
+    for row in deployment_rows:
+        print(
+            f"{row['method']:>6s} | "
+            f"K={int(row['K']):>2d} | "
+            f"{row['detector']:<20s} | "
+            f"TPR={row['TPR']:.4f} "
+            f"FPR={row['FPR']:.4f} "
+            f"epoch={row['epoch']}"
+        )
+
+    print()
     print(
-        f"Benchmark best under FPR <= "
+        f"SECONDARY benchmark best under FPR <= "
         f"{args.target_fpr:.3f}:"
     )
 
@@ -1095,6 +1364,16 @@ def main():
             f"TPR={row['TPR']:.4f} "
             f"FPR={row['FPR']:.4f} "
             f"epoch={row['epoch']}"
+        )
+
+    print()
+    print("AUC summary:")
+    for row in auc_rows:
+        print(
+            f"{row['method']:>6s} | K={int(row['K']):>2d} | "
+            f"raw={row['raw_best_auc']:.6f} "
+            f"z={row['class_z_best_auc']:.6f} "
+            f"pair={row['cumulative_pairwise_best_auc']:.6f}"
         )
 
     print()
