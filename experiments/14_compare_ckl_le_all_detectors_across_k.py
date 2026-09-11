@@ -120,6 +120,15 @@ def parse_args():
         nargs="+",
         default=(1.0, 1.5, 2.0, 2.5, 3.0),
     )
+    p.add_argument(
+        "--fixed-ckl-tau",
+        type=float,
+        default=None,
+        help=(
+            "Use a pre-frozen CKL threshold and skip labeled threshold "
+            "selection. For noise-rate validation use 2.5."
+        ),
+    )
 
     # Fixed non-threshold hyperparameters for CKL.
     p.add_argument("--ckl-sliding-ell", type=int, default=20)
@@ -580,159 +589,181 @@ def main():
     )
 
     # ============================================================
-    # Select ONE common CKL tau across all K and all 3 detectors.
+    # CKL threshold:
+    # - exploratory seed-66 run may select one common tau;
+    # - validation runs MUST pass --fixed-ckl-tau to avoid retuning.
     # ============================================================
     tau_selection_rows = []
 
-    for tau in args.ckl_taus:
-        combo_rows = []
-        eligible = True
+    if args.fixed_ckl_tau is not None:
+        chosen_tau = float(args.fixed_ckl_tau)
 
-        for K in args.K_values:
-            dK = per_k[int(K)]
-            z_tn = dK["z_tn"]
-            eps = dK["epochs_analysis"]
-            m = dK["m"]
+        tau_selection_rows.append({
+            "tau": chosen_tau,
+            "eligible_all_9": True,
+            "mean_TPR": np.nan,
+            "min_TPR": np.nan,
+            "mean_FPR": np.nan,
+            "selection_mode": "pre_frozen_no_retuning",
+        })
 
-            # min-run
-            hit = np.asarray(z_tn >= float(tau), dtype=bool)
-            pred = minrun_from_hits(hit, m)
-            rows = trajectory_rows(
-                "CKL",
-                K,
-                "min_run",
-                "fixed_z_common_tau",
-                {
+        print()
+        print(
+            f"Using pre-frozen common CKL tau = {chosen_tau} "
+            "(no threshold selection on this dataset)"
+        )
+    else:
+        for tau in args.ckl_taus:
+            combo_rows = []
+            eligible_tau = True
+
+            for K in args.K_values:
+                dK = per_k[int(K)]
+                z_tn = dK["z_tn"]
+                eps = dK["epochs_analysis"]
+                m = dK["m"]
+
+                # min-run
+                hit = np.asarray(z_tn >= float(tau), dtype=bool)
+                pred = minrun_from_hits(hit, m)
+                rows = trajectory_rows(
+                    "CKL",
+                    K,
+                    "min_run",
+                    "fixed_z_common_tau",
+                    {
+                        "tau": float(tau),
+                        "m": int(m),
+                    },
+                    pred,
+                    y,
+                    eps,
+                )
+                best = best_over_epoch(
+                    rows,
+                    args.target_fpr,
+                )
+                if best is None:
+                    eligible_tau = False
+                else:
+                    combo_rows.append(best)
+
+                # sliding
+                pred = sliding_from_hits(
+                    hit,
+                    args.ckl_sliding_ell,
+                    args.ckl_sliding_k,
+                )
+                rows = trajectory_rows(
+                    "CKL",
+                    K,
+                    "sliding_window",
+                    "fixed_z_common_tau",
+                    {
+                        "tau": float(tau),
+                        "ell": int(args.ckl_sliding_ell),
+                        "k": int(args.ckl_sliding_k),
+                    },
+                    pred,
+                    y,
+                    eps,
+                )
+                best = best_over_epoch(
+                    rows,
+                    args.target_fpr,
+                )
+                if best is None:
+                    eligible_tau = False
+                else:
+                    combo_rows.append(best)
+
+                # EWMA with SAME tau
+                ewma_score_tn = ewma_continuous(
+                    z_tn,
+                    args.ckl_ewma_lambda,
+                )
+                pred = sticky_threshold(
+                    ewma_score_tn,
+                    tau,
+                )
+                rows = trajectory_rows(
+                    "CKL",
+                    K,
+                    "ewma",
+                    "fixed_z_common_tau",
+                    {
+                        "tau": float(tau),
+                        "lambda": float(args.ckl_ewma_lambda),
+                    },
+                    pred,
+                    y,
+                    eps,
+                )
+                best = best_over_epoch(
+                    rows,
+                    args.target_fpr,
+                )
+                if best is None:
+                    eligible_tau = False
+                else:
+                    combo_rows.append(best)
+
+            if eligible_tau and len(combo_rows) == 9:
+                tprs = np.asarray(
+                    [r["TPR"] for r in combo_rows],
+                    dtype=np.float64,
+                )
+                fprs = np.asarray(
+                    [r["FPR"] for r in combo_rows],
+                    dtype=np.float64,
+                )
+
+                tau_selection_rows.append({
                     "tau": float(tau),
-                    "m": int(m),
-                },
-                pred,
-                y,
-                eps,
-            )
-            best = best_over_epoch(
-                rows,
-                args.target_fpr,
-            )
-            if best is None:
-                eligible = False
+                    "eligible_all_9": True,
+                    "mean_TPR": float(np.mean(tprs)),
+                    "min_TPR": float(np.min(tprs)),
+                    "mean_FPR": float(np.mean(fprs)),
+                    "selection_mode": "exploratory_labeled_selection",
+                })
             else:
-                combo_rows.append(best)
-
-            # sliding
-            pred = sliding_from_hits(
-                hit,
-                args.ckl_sliding_ell,
-                args.ckl_sliding_k,
-            )
-            rows = trajectory_rows(
-                "CKL",
-                K,
-                "sliding_window",
-                "fixed_z_common_tau",
-                {
+                tau_selection_rows.append({
                     "tau": float(tau),
-                    "ell": int(args.ckl_sliding_ell),
-                    "k": int(args.ckl_sliding_k),
-                },
-                pred,
-                y,
-                eps,
-            )
-            best = best_over_epoch(
-                rows,
-                args.target_fpr,
-            )
-            if best is None:
-                eligible = False
-            else:
-                combo_rows.append(best)
+                    "eligible_all_9": False,
+                    "mean_TPR": np.nan,
+                    "min_TPR": np.nan,
+                    "mean_FPR": np.nan,
+                    "selection_mode": "exploratory_labeled_selection",
+                })
 
-            # EWMA with SAME tau
-            ewma_score_tn = ewma_continuous(
-                z_tn,
-                args.ckl_ewma_lambda,
-            )
-            pred = sticky_threshold(
-                ewma_score_tn,
-                tau,
-            )
-            rows = trajectory_rows(
-                "CKL",
-                K,
-                "ewma",
-                "fixed_z_common_tau",
-                {
-                    "tau": float(tau),
-                    "lambda": float(args.ckl_ewma_lambda),
-                },
-                pred,
-                y,
-                eps,
-            )
-            best = best_over_epoch(
-                rows,
-                args.target_fpr,
-            )
-            if best is None:
-                eligible = False
-            else:
-                combo_rows.append(best)
+        eligible_rows = [
+            r for r in tau_selection_rows
+            if r["eligible_all_9"]
+        ]
 
-        if eligible and len(combo_rows) == 9:
-            tprs = np.asarray(
-                [r["TPR"] for r in combo_rows],
-                dtype=np.float64,
-            )
-            fprs = np.asarray(
-                [r["FPR"] for r in combo_rows],
-                dtype=np.float64,
+        if not eligible_rows:
+            raise RuntimeError(
+                "No common CKL tau was feasible for all 3 detectors "
+                "at all K values under the requested FPR budget."
             )
 
-            tau_selection_rows.append({
-                "tau": float(tau),
-                "eligible_all_9": True,
-                "mean_TPR": float(np.mean(tprs)),
-                "min_TPR": float(np.min(tprs)),
-                "mean_FPR": float(np.mean(fprs)),
-            })
-        else:
-            tau_selection_rows.append({
-                "tau": float(tau),
-                "eligible_all_9": False,
-                "mean_TPR": np.nan,
-                "min_TPR": np.nan,
-                "mean_FPR": np.nan,
-            })
-
-    eligible = [
-        r for r in tau_selection_rows
-        if r["eligible_all_9"]
-    ]
-
-    if not eligible:
-        raise RuntimeError(
-            "No common CKL tau was feasible for all 3 detectors "
-            "at all K values under the requested FPR budget."
+        eligible_rows.sort(
+            key=lambda r: (
+                -float(r["mean_TPR"]),
+                -float(r["min_TPR"]),
+                float(r["mean_FPR"]),
+                float(r["tau"]),
+            )
         )
 
-    eligible.sort(
-        key=lambda r: (
-            -float(r["mean_TPR"]),
-            -float(r["min_TPR"]),
-            float(r["mean_FPR"]),
-            float(r["tau"]),
+        chosen_tau = float(
+            eligible_rows[0]["tau"]
         )
-    )
 
-    chosen_tau = float(
-        eligible[0]["tau"]
-    )
-
-    print()
-    print(
-        f"Chosen common CKL tau = {chosen_tau}"
-    )
+        print()
+        print(
+            f"Chosen common CKL tau = {chosen_tau}"
+        )
 
     write_csv(
         args.output_dir
@@ -1268,6 +1299,11 @@ def main():
                 float(v) for v in args.ckl_taus
             ],
             "chosen_common_tau": chosen_tau,
+            "tau_selection_mode": (
+                "pre_frozen_no_retuning"
+                if args.fixed_ckl_tau is not None
+                else "exploratory_labeled_selection"
+            ),
             "tau_scope":
                 "same tau for CKL min-run, sliding-window, EWMA, and for all tested K values",
             "sliding_ell":
@@ -1305,7 +1341,12 @@ def main():
         "target_fpr_benchmark":
             float(args.target_fpr),
         "selection_warning":
-            "common tau and benchmark-best epochs use labeled seed-66 data; freeze chosen settings before independent validation",
+            (
+                "CKL tau is pre-frozen when --fixed-ckl-tau is supplied. "
+                "Best-over-epoch summaries still use labels retrospectively "
+                "and should be treated as diagnostic unless evaluation epoch "
+                "or stopping rule is also frozen."
+            ),
         "production_modules_modified":
             False,
     }
