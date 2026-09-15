@@ -520,6 +520,152 @@ def plot_compact_all_detectors(
     plt.close(fig)
 
 
+
+def summarize_temporal_quality(
+    rows,
+    tpr_thresholds=(0.80, 0.90),
+    fpr_limit=0.05,
+    sustained_start=60,
+    sustained_end=120,
+    late_start=180,
+    late_end=200,
+):
+    """Summarize one detector trajectory with emphasis on early useful detection.
+
+    Earlier is better for t_eta_fprXX metrics.
+
+    The main early-detection metric is:
+        t_{eta,phi} = first epoch with TPR >= eta and FPR <= phi
+
+    Also reports:
+      - peak TPR and its epoch/FPR
+      - sustained mean TPR/FPR over [sustained_start, sustained_end]
+      - late mean TPR/FPR over [late_start, late_end]
+      - decay = peak_TPR - TPR_at_final_epoch
+      - time-average TPR while FPR <= fpr_limit
+      - fraction of monitored epochs satisfying FPR <= fpr_limit
+    """
+    if not rows:
+        return {}
+
+    s = sorted(rows, key=lambda r: r["epoch"])
+
+    epochs = np.asarray([r["epoch"] for r in s], dtype=np.int64)
+    tpr = np.asarray([r["TPR"] for r in s], dtype=np.float64)
+    fpr = np.asarray([r["FPR"] for r in s], dtype=np.float64)
+
+    peak_idx = int(np.nanargmax(tpr))
+
+    out = {
+        "monitor_start_epoch": int(epochs[0]),
+        "monitor_end_epoch": int(epochs[-1]),
+        "peak_TPR": float(tpr[peak_idx]),
+        "peak_epoch": int(epochs[peak_idx]),
+        "FPR_at_peak_TPR": float(fpr[peak_idx]),
+        "final_TPR": float(tpr[-1]),
+        "final_FPR": float(fpr[-1]),
+        "TPR_decay_peak_to_final": float(tpr[peak_idx] - tpr[-1]),
+    }
+
+    for eta in tpr_thresholds:
+        good = np.flatnonzero(
+            (tpr >= float(eta)) & (fpr <= float(fpr_limit))
+        )
+
+        tag = f"{int(round(eta * 100)):02d}"
+        if good.size:
+            j = int(good[0])
+            out[f"first_epoch_TPR{tag}_FPRle05"] = int(epochs[j])
+            out[f"TPR_at_first_TPR{tag}_FPRle05"] = float(tpr[j])
+            out[f"FPR_at_first_TPR{tag}_FPRle05"] = float(fpr[j])
+            out[f"delay_from_monitor_start_TPR{tag}_FPRle05"] = int(
+                epochs[j] - epochs[0]
+            )
+        else:
+            out[f"first_epoch_TPR{tag}_FPRle05"] = -1
+            out[f"TPR_at_first_TPR{tag}_FPRle05"] = np.nan
+            out[f"FPR_at_first_TPR{tag}_FPRle05"] = np.nan
+            out[f"delay_from_monitor_start_TPR{tag}_FPRle05"] = -1
+
+    sustained = (
+        (epochs >= int(sustained_start))
+        & (epochs <= int(sustained_end))
+    )
+    if np.any(sustained):
+        out["sustained_start"] = int(sustained_start)
+        out["sustained_end"] = int(sustained_end)
+        out["sustained_mean_TPR"] = float(np.mean(tpr[sustained]))
+        out["sustained_mean_FPR"] = float(np.mean(fpr[sustained]))
+    else:
+        out["sustained_start"] = int(sustained_start)
+        out["sustained_end"] = int(sustained_end)
+        out["sustained_mean_TPR"] = np.nan
+        out["sustained_mean_FPR"] = np.nan
+
+    late = (
+        (epochs >= int(late_start))
+        & (epochs <= int(late_end))
+    )
+    if np.any(late):
+        out["late_start"] = int(late_start)
+        out["late_end"] = int(late_end)
+        out["late_mean_TPR"] = float(np.mean(tpr[late]))
+        out["late_mean_FPR"] = float(np.mean(fpr[late]))
+    else:
+        out["late_start"] = int(late_start)
+        out["late_end"] = int(late_end)
+        out["late_mean_TPR"] = np.nan
+        out["late_mean_FPR"] = np.nan
+
+    acceptable = fpr <= float(fpr_limit)
+    out["fraction_epochs_FPRle05"] = float(np.mean(acceptable))
+
+    # This intentionally rewards early and sustained useful detection.
+    # Epochs above the FPR limit contribute zero TPR.
+    useful_tpr = np.where(acceptable, tpr, 0.0)
+    out["time_average_useful_TPR_FPRle05"] = float(np.mean(useful_tpr))
+
+    # Normalized trapezoidal area over monitored epochs.
+    if epochs.size > 1:
+        span = float(epochs[-1] - epochs[0])
+        if span > 0:
+            out["time_AUC_useful_TPR_FPRle05"] = float(
+                np.trapz(useful_tpr, epochs) / span
+            )
+        else:
+            out["time_AUC_useful_TPR_FPRle05"] = float(useful_tpr[0])
+    else:
+        out["time_AUC_useful_TPR_FPRle05"] = float(useful_tpr[0])
+
+    return out
+
+
+def temporal_preference_key(row):
+    """Sort key for practical detector selection.
+
+    Priority:
+      1) reaches TPR>=0.90 with FPR<=0.05
+      2) earlier such epoch is better
+      3) reaches TPR>=0.80 with FPR<=0.05
+      4) earlier such epoch is better
+      5) larger useful time-AUC
+      6) larger sustained mean TPR
+      7) smaller decay
+    """
+    t90 = row.get("first_epoch_TPR90_FPRle05", -1)
+    t80 = row.get("first_epoch_TPR80_FPRle05", -1)
+
+    return (
+        0 if t90 >= 0 else 1,
+        t90 if t90 >= 0 else 10**9,
+        0 if t80 >= 0 else 1,
+        t80 if t80 >= 0 else 10**9,
+        -float(row.get("time_AUC_useful_TPR_FPRle05", -np.inf)),
+        -float(row.get("sustained_mean_TPR", -np.inf)),
+        float(row.get("TPR_decay_peak_to_final", np.inf)),
+    )
+
+
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -855,9 +1001,10 @@ def main():
         gc.collect()
 
     # ------------------------------------------------------------
-    # Best-over-epoch summary for convenience.
+    # Retrospective best-epoch summary + early-detection summary.
     # ------------------------------------------------------------
     best_rows = []
+    temporal_rows = []
 
     keys = sorted(
         set(
@@ -882,16 +1029,16 @@ def main():
             )
         ]
 
-        # Same primary convention as previous experiments:
-        # highest TPR over epoch, report the FPR at that same epoch.
-        sub.sort(
+        # Retrospective best TPR summary.
+        sub_best = sorted(
+            sub,
             key=lambda r: (
                 -r["TPR"],
                 r["FPR"],
                 r["epoch"],
             )
         )
-        best = sub[0]
+        best = sub_best[0]
 
         best_rows.append({
             "noise_rate": noise_rate,
@@ -903,10 +1050,67 @@ def main():
             "epoch": best["epoch"],
         })
 
+        # Practical temporal summary emphasizing earlier useful detection.
+        summary = summarize_temporal_quality(
+            sub,
+            tpr_thresholds=(0.80, 0.90),
+            fpr_limit=0.05,
+            sustained_start=60,
+            sustained_end=120,
+            late_start=180,
+            late_end=200,
+        )
+
+        temporal_rows.append({
+            "noise_rate": noise_rate,
+            "K": K,
+            "variant": variant,
+            "detector": detector,
+            **summary,
+        })
+
     write_csv(
         args.output_dir
         / "best_over_epoch_summary.csv",
         best_rows,
+    )
+
+    write_csv(
+        args.output_dir
+        / "temporal_selection_summary.csv",
+        temporal_rows,
+    )
+
+    # Rank candidates within each noise/K block using early useful detection.
+    ranked_rows = []
+
+    block_keys = sorted(
+        set(
+            (r["noise_rate"], r["K"])
+            for r in temporal_rows
+        )
+    )
+
+    for noise_rate, K in block_keys:
+        block = [
+            dict(r)
+            for r in temporal_rows
+            if (
+                r["noise_rate"] == noise_rate
+                and r["K"] == K
+            )
+        ]
+
+        block.sort(key=temporal_preference_key)
+
+        for rank, row in enumerate(block, start=1):
+            row["temporal_preference_rank"] = rank
+            ranked_rows.append(row)
+
+    write_csv(
+        args.output_dir
+        / "temporal_selection_ranked.csv",
+        ranked_rows,
     )
 
     config = {
@@ -938,6 +1142,18 @@ def main():
         "sliding_k": args.sliding_k,
         "evaluation_note":
             "known synthetic noise mask is used only to compute TPR/FPR",
+        "selection_priority":
+            "prefer high TPR at low FPR as early as possible, then sustained performance",
+        "early_detection_metrics": {
+            "primary": "first epoch with TPR>=0.90 and FPR<=0.05",
+            "secondary": "first epoch with TPR>=0.80 and FPR<=0.05",
+            "additional": [
+                "time_AUC_useful_TPR_FPRle05",
+                "sustained_mean_TPR over epochs 60-120",
+                "late_mean_TPR over epochs 180-200",
+                "TPR_decay_peak_to_final"
+            ]
+        },
         "important_q_note":
             "fixed q=0.10 imposes a maximum achievable TPR of 0.5 when true noise rate is 20%",
     }
@@ -958,6 +1174,14 @@ def main():
     print(
         args.output_dir
         / "best_over_epoch_summary.csv"
+    )
+    print(
+        args.output_dir
+        / "temporal_selection_summary.csv"
+    )
+    print(
+        args.output_dir
+        / "temporal_selection_ranked.csv"
     )
     print(f"Plots under: {args.output_dir}/noiseXX/KXX/")
 
