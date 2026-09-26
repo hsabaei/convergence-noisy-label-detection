@@ -2,6 +2,8 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import argparse
+import math
+
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -74,34 +76,85 @@ def load_d2l(path):
             )
         return col
 
-    train_all_col = pick(train_all_candidates, "D2L overall training accuracy")
-    train_noisy_col = pick(train_noisy_candidates, "D2L noisy-subset training accuracy")
-    test_col = pick(test_candidates, "D2L test accuracy")
-
     return pd.DataFrame({
         "epoch": df["epoch"],
-        "train_all": df[train_all_col],
-        "train_noisy": df[train_noisy_col],
-        "test": df[test_col],
+        "train_all": df[pick(train_all_candidates, "D2L overall training accuracy")],
+        "train_noisy": df[pick(train_noisy_candidates, "D2L noisy-subset training accuracy")],
+        "test": df[pick(test_candidates, "D2L test accuracy")],
     })
 
 
-def plot_curves(series, metric, ylabel, title, output_path, ylim):
+def auto_percent_ylim(series, metric, start_epoch, pad=0.25, step=0.5):
+    """
+    Compute a readable y-range in percentage points from the displayed epoch range.
+    Rounds bounds to 'step' and adds 'pad' percentage points.
+    """
+    vals = []
+    for df in series.values():
+        shown = df[df["epoch"] >= start_epoch]
+        vals.extend((100.0 * shown[metric]).tolist())
+
+    lo = min(vals) - pad
+    hi = max(vals) + pad
+
+    lo = math.floor(lo / step) * step
+    hi = math.ceil(hi / step) * step
+
+    if hi - lo < 2.0:
+        mid = 0.5 * (hi + lo)
+        lo = math.floor((mid - 1.0) / step) * step
+        hi = math.ceil((mid + 1.0) / step) * step
+
+    return lo, hi
+
+
+def plot_curves(
+    series,
+    metric,
+    ylabel,
+    title,
+    output_path,
+    *,
+    start_epoch=None,
+    ylim=None,
+    auto_ylim=False,
+    pad=0.25,
+    step=0.5,
+):
     fig, ax = plt.subplots(figsize=(10.5, 6.2))
 
     for label, df in series.items():
+        shown = df
+        if start_epoch is not None:
+            shown = df[df["epoch"] >= start_epoch]
+
         ax.plot(
-            df["epoch"],
-            100.0 * df[metric],
+            shown["epoch"],
+            100.0 * shown[metric],
             linewidth=2.1,
             label=label,
         )
 
+    if start_epoch is not None:
+        ax.set_xlim(left=start_epoch)
+    else:
+        ax.set_xlim(left=1)
+
+    if auto_ylim:
+        lo, hi = auto_percent_ylim(
+            series,
+            metric,
+            start_epoch if start_epoch is not None else 1,
+            pad=pad,
+            step=step,
+        )
+        ax.set_ylim(lo, hi)
+    elif ylim is not None:
+        ax.set_ylim(*ylim)
+
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=15)
-    ax.set_xlim(left=1)
-    ax.set_ylim(*ylim)
     ax.grid(alpha=0.25)
     ax.legend(fontsize=10)
     fig.tight_layout()
@@ -116,7 +169,6 @@ def write_summary(series, out_csv):
 
     for label, df in series.items():
         best_test_idx = df["test"].idxmax()
-
         late = df[df["epoch"].between(150, 200)]
 
         rows.append({
@@ -161,7 +213,13 @@ def main():
     )
     p.add_argument(
         "--output-dir",
-        default="results/five_method_accuracy_plots_v2",
+        default="results/five_method_accuracy_plots_v3",
+    )
+    p.add_argument(
+        "--zoom-start-epoch",
+        type=int,
+        default=40,
+        help="Start epoch for zoomed overall-train and test plots.",
     )
 
     args = p.parse_args()
@@ -182,41 +240,63 @@ def main():
         "D2L": d2l,
     }
 
-    # 1) Zoomed clean test accuracy.
+    # Test accuracy: show the part of training where methods begin to separate.
+    # Y limits are computed from the actual displayed values, so this works
+    # for 5%, 10%, 20%, etc. without manually changing the scale.
     plot_curves(
         series,
         metric="test",
         ylabel="Test accuracy (%)",
         title="Test Accuracy During Training",
         output_path=outdir / "test_accuracy_five_methods_zoomed",
-        ylim=(89, 93),
+        start_epoch=args.zoom_start_epoch,
+        auto_ylim=True,
+        pad=0.20,
+        step=0.5,
     )
 
-    # 2) Zoomed overall true-label training accuracy.
+    # Overall true-label training accuracy, also dynamically scaled.
     plot_curves(
         series,
         metric="train_all",
         ylabel="Training accuracy (%)",
         title="Training Accuracy During Training",
         output_path=outdir / "training_accuracy_all_five_methods_zoomed",
-        ylim=(93, 99),
+        start_epoch=args.zoom_start_epoch,
+        auto_ylim=True,
+        pad=0.20,
+        step=0.5,
     )
 
-    # 3) True-label training accuracy on only the synthetically noisy samples.
+    # Noisy-subset plot keeps the full 0-100 scale because the collapse of
+    # the baseline is itself the main result.
     plot_curves(
         series,
         metric="train_noisy",
         ylabel="Accuracy on noisy samples (%)",
         title="True-Label Accuracy on Noisy Training Samples",
         output_path=outdir / "training_accuracy_noisy_subset_five_methods",
+        start_epoch=None,
         ylim=(0, 100),
     )
 
     write_summary(
         series,
-        outdir / "five_method_accuracy_summary_v2.csv",
+        outdir / "five_method_accuracy_summary_v3.csv",
     )
 
+    # Report selected automatic limits to the log.
+    test_ylim = auto_percent_ylim(
+        series, "test", args.zoom_start_epoch, pad=0.20, step=0.5
+    )
+    train_ylim = auto_percent_ylim(
+        series, "train_all", args.zoom_start_epoch, pad=0.20, step=0.5
+    )
+
+    print(f"Zoom start epoch: {args.zoom_start_epoch}")
+    print(f"Automatic test y-limits: {test_ylim}")
+    print(f"Automatic training y-limits: {train_ylim}")
+    print()
     print("Created:")
     for name in [
         "test_accuracy_five_methods_zoomed.png",
@@ -225,7 +305,7 @@ def main():
         "training_accuracy_all_five_methods_zoomed.pdf",
         "training_accuracy_noisy_subset_five_methods.png",
         "training_accuracy_noisy_subset_five_methods.pdf",
-        "five_method_accuracy_summary_v2.csv",
+        "five_method_accuracy_summary_v3.csv",
     ]:
         print(outdir / name)
 
