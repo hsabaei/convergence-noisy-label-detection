@@ -1,239 +1,187 @@
 #!/usr/bin/env python3
-import argparse
 from pathlib import Path
+import argparse
 
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def pick_col(df, candidates, name, csv_path):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    raise KeyError(
-        f"Could not find column for '{name}' in {csv_path}.\n"
-        f"Tried: {candidates}\n"
-        f"Available columns: {list(df.columns)}"
-    )
+def read_csv(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return pd.read_csv(path)
 
 
-def load_case(csv_path, case_name, test_candidates, train_candidates):
-    df = pd.read_csv(csv_path)
+def require_columns(df, path, cols):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"Missing columns in {path}: {missing}\n"
+            f"Available columns: {list(df.columns)}"
+        )
 
-    epoch_col = pick_col(
-        df,
-        ["epoch", "Epoch", "epochs"],
-        f"{case_name}: epoch",
-        csv_path,
-    )
-    test_col = pick_col(df, test_candidates, f"{case_name}: test acc", csv_path)
-    train_col = pick_col(df, train_candidates, f"{case_name}: train acc", csv_path)
 
-    out = pd.DataFrame({
-        "epoch": df[epoch_col].to_numpy(),
-        "test_acc": df[test_col].to_numpy(),
-        "train_acc": df[train_col].to_numpy(),
+def load_score_guided(path, adaptive=True):
+    df = read_csv(path)
+
+    if adaptive:
+        train_col = "adaptive_train_true_accuracy_all"
+        test_col = "adaptive_test_accuracy"
+    else:
+        train_col = "baseline_train_true_accuracy_all"
+        test_col = "baseline_test_accuracy"
+
+    require_columns(df, path, ["epoch", train_col, test_col])
+
+    return pd.DataFrame({
+        "epoch": df["epoch"],
+        "train_acc": df[train_col],
+        "test_acc": df[test_col],
     })
-    return out
 
 
-def plot_metric(case_to_df, metric, ylabel, title, out_png, out_pdf):
-    plt.figure(figsize=(10, 6))
+def load_d2l(path):
+    df = read_csv(path)
 
-    order = ["baseline", "ckl", "le", "combined", "d2l"]
-    pretty = {
-        "baseline": "Baseline",
-        "ckl": "CKL",
-        "le": "LE",
-        "combined": "CKL+LE",
-        "d2l": "D2L",
-    }
+    # These are the column names produced by
+    # experiments/26_train_d2l_intervention.py
+    train_candidates = [
+        "d2l_train_true_accuracy_all",
+        "train_true_accuracy_all",
+    ]
+    test_candidates = [
+        "d2l_test_accuracy",
+        "test_accuracy",
+    ]
 
-    for key in order:
-        if key not in case_to_df:
-            continue
-        df = case_to_df[key]
-        plt.plot(df["epoch"], df[metric], label=pretty[key], linewidth=2)
+    train_col = next((c for c in train_candidates if c in df.columns), None)
+    test_col = next((c for c in test_candidates if c in df.columns), None)
 
-    plt.xlabel("Epoch")
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
+    if train_col is None or test_col is None:
+        raise KeyError(
+            f"Could not find D2L accuracy columns in {path}\n"
+            f"Tried training: {train_candidates}\n"
+            f"Tried test: {test_candidates}\n"
+            f"Available columns: {list(df.columns)}"
+        )
 
-    plt.savefig(out_png, dpi=200)
-    plt.savefig(out_pdf)
-    plt.close()
+    return pd.DataFrame({
+        "epoch": df["epoch"],
+        "train_acc": df[train_col],
+        "test_acc": df[test_col],
+    })
 
 
-def write_summary(case_to_df, out_csv):
-    rows = []
-    pretty = {
-        "baseline": "Baseline",
-        "ckl": "CKL",
-        "le": "LE",
-        "combined": "CKL+LE",
-        "d2l": "D2L",
-    }
+def plot_curves(series, metric, ylabel, title, output_path):
+    fig, ax = plt.subplots(figsize=(10.5, 6.2))
 
-    for key, df in case_to_df.items():
-        best_test_idx = df["test_acc"].idxmax()
-        best_train_idx = df["train_acc"].idxmax()
+    for label, df in series.items():
+        ax.plot(
+            df["epoch"],
+            100.0 * df[metric],
+            linewidth=2.0,
+            label=label,
+        )
 
-        rows.append({
-            "method": pretty.get(key, key),
-            "final_epoch": int(df["epoch"].iloc[-1]),
-            "final_test_acc": float(df["test_acc"].iloc[-1]),
-            "best_test_acc": float(df["test_acc"].iloc[best_test_idx]),
-            "best_test_epoch": int(df["epoch"].iloc[best_test_idx]),
-            "final_train_true_acc": float(df["train_acc"].iloc[-1]),
-            "best_train_true_acc": float(df["train_acc"].iloc[best_train_idx]),
-            "best_train_true_epoch": int(df["epoch"].iloc[best_train_idx]),
-        })
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xlim(left=1)
+    ax.set_ylim(0, 100)
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
 
-    summary = pd.DataFrame(rows)
-    summary = summary.sort_values("method")
-    summary.to_csv(out_csv, index=False)
-    print(f"Saved summary to: {out_csv}")
-    print(summary.to_string(index=False))
+    fig.savefig(output_path.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
 
-    parser.add_argument(
+    p.add_argument(
         "--ckl-csv",
         default="results/score_guided_intervention/ckl__ewma/epoch_summary.csv",
     )
-    parser.add_argument(
+    p.add_argument(
         "--le-csv",
         default="results/score_guided_intervention/le__ewma/epoch_summary.csv",
     )
-    parser.add_argument(
+    p.add_argument(
         "--combined-csv",
         default="results/score_guided_intervention/combined__ewma/epoch_summary.csv",
     )
-    parser.add_argument(
+    p.add_argument(
         "--d2l-csv",
         default="results/d2l_intervention/epoch_summary.csv",
     )
-    parser.add_argument(
+    p.add_argument(
         "--output-dir",
         default="results/five_method_accuracy_plots",
     )
 
-    args = parser.parse_args()
+    args = p.parse_args()
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Baseline is taken from the BASE columns of the combined run
-    baseline_df = load_case(
-        args.combined_csv,
-        "baseline",
-        test_candidates=[
-            "test_base_acc",
-            "base_test_acc",
-            "test_acc_base",
-        ],
-        train_candidates=[
-            "train_true_noisy_base_acc",
-            "base_train_true_noisy_acc",
-            "train_true_base_acc",
-        ],
-    )
+    # The paired baseline is identical across CKL/LE/combined.
+    # Use the baseline columns from the combined run.
+    baseline = load_score_guided(args.combined_csv, adaptive=False)
+    ckl = load_score_guided(args.ckl_csv, adaptive=True)
+    le = load_score_guided(args.le_csv, adaptive=True)
+    combined = load_score_guided(args.combined_csv, adaptive=True)
+    d2l = load_d2l(args.d2l_csv)
 
-    # Score-guided adaptive runs
-    ckl_df = load_case(
-        args.ckl_csv,
-        "ckl",
-        test_candidates=[
-            "test_adapt_acc",
-            "adaptive_test_acc",
-            "test_acc_adapt",
-        ],
-        train_candidates=[
-            "train_true_noisy_adapt_acc",
-            "adaptive_train_true_noisy_acc",
-            "train_true_adapt_acc",
-        ],
-    )
-
-    le_df = load_case(
-        args.le_csv,
-        "le",
-        test_candidates=[
-            "test_adapt_acc",
-            "adaptive_test_acc",
-            "test_acc_adapt",
-        ],
-        train_candidates=[
-            "train_true_noisy_adapt_acc",
-            "adaptive_train_true_noisy_acc",
-            "train_true_adapt_acc",
-        ],
-    )
-
-    combined_df = load_case(
-        args.combined_csv,
-        "combined",
-        test_candidates=[
-            "test_adapt_acc",
-            "adaptive_test_acc",
-            "test_acc_adapt",
-        ],
-        train_candidates=[
-            "train_true_noisy_adapt_acc",
-            "adaptive_train_true_noisy_acc",
-            "train_true_adapt_acc",
-        ],
-    )
-
-    # D2L run
-    d2l_df = load_case(
-        args.d2l_csv,
-        "d2l",
-        test_candidates=[
-            "test_d2l_acc",
-            "d2l_test_acc",
-            "test_acc_d2l",
-        ],
-        train_candidates=[
-            "train_true_noisy_d2l_acc",
-            "d2l_train_true_noisy_acc",
-            "train_true_d2l_acc",
-        ],
-    )
-
-    case_to_df = {
-        "baseline": baseline_df,
-        "ckl": ckl_df,
-        "le": le_df,
-        "combined": combined_df,
-        "d2l": d2l_df,
+    series = {
+        "Baseline": baseline,
+        "CKL": ckl,
+        "LE": le,
+        "CKL+LE": combined,
+        "D2L": d2l,
     }
 
-    plot_metric(
-        case_to_df=case_to_df,
-        metric="test_acc",
-        ylabel="Test Accuracy",
-        title="Test Accuracy During Training",
-        out_png=outdir / "test_accuracy_five_methods.png",
-        out_pdf=outdir / "test_accuracy_five_methods.pdf",
-    )
-
-    plot_metric(
-        case_to_df=case_to_df,
+    # Overall training accuracy against original true CIFAR-10 labels.
+    plot_curves(
+        series,
         metric="train_acc",
-        ylabel="Training Accuracy (measured against true labels)",
-        title="Training Accuracy During Training (True Labels)",
-        out_png=outdir / "train_true_accuracy_five_methods.png",
-        out_pdf=outdir / "train_true_accuracy_five_methods.pdf",
+        ylabel="Training accuracy (%)",
+        title="Training Accuracy During Training",
+        output_path=outdir / "training_accuracy_five_methods",
     )
 
-    write_summary(case_to_df, outdir / "five_method_accuracy_summary.csv")
+    # Clean CIFAR-10 test accuracy.
+    plot_curves(
+        series,
+        metric="test_acc",
+        ylabel="Test accuracy (%)",
+        title="Test Accuracy During Training",
+        output_path=outdir / "test_accuracy_five_methods",
+    )
 
-    print(f"Saved plots to: {outdir}")
+    rows = []
+    for label, df in series.items():
+        best_test_i = df["test_acc"].idxmax()
+        rows.append({
+            "method": label,
+            "final_train_accuracy": float(df["train_acc"].iloc[-1]),
+            "final_test_accuracy": float(df["test_acc"].iloc[-1]),
+            "best_test_accuracy": float(df.loc[best_test_i, "test_acc"]),
+            "best_test_epoch": int(df.loc[best_test_i, "epoch"]),
+        })
+
+    pd.DataFrame(rows).to_csv(
+        outdir / "five_method_accuracy_summary.csv",
+        index=False,
+    )
+
+    print("Created:")
+    print(outdir / "training_accuracy_five_methods.png")
+    print(outdir / "training_accuracy_five_methods.pdf")
+    print(outdir / "test_accuracy_five_methods.png")
+    print(outdir / "test_accuracy_five_methods.pdf")
+    print(outdir / "five_method_accuracy_summary.csv")
 
 
 if __name__ == "__main__":
