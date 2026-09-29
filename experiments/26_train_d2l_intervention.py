@@ -21,8 +21,8 @@ D2L logic
 2) After each epoch, estimate ONE mean LID value from the penultimate-layer
    representations of 10 random batches x 128 samples.
 3) Detect the turning point when the current LID is more than 2 standard
-   deviations above the mean of the previous 5 LID values, after a CIFAR-10
-   initialization period of 40 epochs.
+   deviations above the mean of the previous `w` LID values, once `w`
+   previous LID values are available.
 4) At the first turning point, roll the D2L model weights back to the model
    state from the previous epoch.
 5) After the turning point, use one GLOBAL alpha for every training sample:
@@ -52,15 +52,15 @@ The original paper used SGD and 120 epochs for CIFAR-10. Here we deliberately
 keep the SAME CNN12 + AdamW + 200-epoch setup as the CKL/LE experiments so
 that only the intervention mechanism changes.
 
-CIFAR-10 D2L monitoring defaults
---------------------------------
-The authors' released implementation uses:
-    init_epoch = 40
+D2L monitoring defaults
+-----------------------
+We follow Algorithm 1 for turning-point detection:
     epoch_win  = 5
     lid_subset_size = 1280
     lid_k = 20
 
-We use the same monitoring defaults here.
+The turning-point test begins as soon as `epoch_win` previous LID values
+are available; there is no extra fixed epoch-40 gate.
 """
 
 from __future__ import annotations
@@ -133,7 +133,6 @@ def parse_args():
     p.add_argument("--lid-k", type=int, default=20)
     p.add_argument("--lid-batch-size", type=int, default=128)
     p.add_argument("--lid-num-batches", type=int, default=10)
-    p.add_argument("--turning-init-epoch", type=int, default=40)
     p.add_argument("--lid-window", type=int, default=5)
     p.add_argument("--turning-z", type=float, default=2.0)
 
@@ -151,8 +150,6 @@ def parse_args():
         p.error("--lid-num-batches must be >= 1.")
     if args.lid_window < 2:
         p.error("--lid-window must be >= 2.")
-    if args.turning_init_epoch < 0:
-        p.error("--turning-init-epoch must be nonnegative.")
     if args.turning_z <= 0:
         p.error("--turning-z must be positive.")
 
@@ -389,40 +386,32 @@ def estimate_mean_lid(
 ):
     """Paper-style LID estimate from m random batches.
 
-    We sample m*batch_size distinct examples, split them into m batches,
-    compute LID within each batch, and average all valid sample LIDs.
+    We independently sample m random batches, compute LID within each batch,
+    average the sample LIDs inside each batch, then average the m batch means.
     """
     model.eval()
 
-    n_needed = (
-        int(batch_size)
-        * int(num_batches)
-    )
-
-    if n_needed > len(eval_dataset):
+    if int(batch_size) > len(eval_dataset):
         raise ValueError(
-            f"LID subset needs {n_needed} samples but dataset "
+            f"LID batch needs {batch_size} samples but dataset "
             f"contains {len(eval_dataset)}."
         )
-
-    subset_idx = rng.choice(
-        len(eval_dataset),
-        size=n_needed,
-        replace=False,
-    )
 
     hook = PenultimateFeatureHook(
         model
     )
 
-    all_lids = []
+    batch_mean_lids = []
 
     try:
-        for b in range(num_batches):
-            ids = subset_idx[
-                b * batch_size:
-                (b + 1) * batch_size
-            ]
+        for _b in range(num_batches):
+            # Paper-style random batch sampling: each batch is sampled
+            # independently from the training set.
+            ids = rng.choice(
+                len(eval_dataset),
+                size=int(batch_size),
+                replace=False,
+            )
 
             # Fetch deterministic eval-transformed samples.
             xs = []
@@ -454,23 +443,18 @@ def estimate_mean_lid(
             )
 
             if lids.numel():
-                all_lids.append(
-                    lids.detach().cpu()
+                batch_mean_lids.append(
+                    float(lids.mean().item())
                 )
 
     finally:
         hook.close()
 
-    if not all_lids:
+    if not batch_mean_lids:
         return float("nan")
 
-    all_lids = torch.cat(
-        all_lids,
-        dim=0,
-    )
-
     return float(
-        all_lids.mean().item()
+        np.mean(batch_mean_lids)
     )
 
 
@@ -481,7 +465,6 @@ def estimate_mean_lid(
 def turning_point_now(
     lids,
     epoch,
-    init_epoch,
     window,
     z_threshold,
 ):
@@ -489,9 +472,7 @@ def turning_point_now(
 
     Current LID is compared with the immediately preceding `window` LIDs.
     """
-    if epoch <= init_epoch:
-        return False, np.nan, np.nan
-
+    # Algorithm 1: begin testing once `window` previous LID values exist.
     if len(lids) < window + 1:
         return False, np.nan, np.nan
 
@@ -1088,7 +1069,8 @@ def main():
         f"{args.lid_num_batches} x {args.lid_batch_size}"
     )
     print(
-        f"turning init epoch={args.turning_init_epoch}"
+        "turning init = first epoch with "
+        f"{args.lid_window} previous LID values"
     )
     print(
         f"turning window={args.lid_window}"
@@ -1180,7 +1162,6 @@ def main():
             ) = turning_point_now(
                 lids=lids,
                 epoch=epoch,
-                init_epoch=args.turning_init_epoch,
                 window=args.lid_window,
                 z_threshold=args.turning_z,
             )
@@ -1489,7 +1470,9 @@ def main():
                 args.lid_batch_size
                 * args.lid_num_batches,
             "turning_init_epoch":
-                args.turning_init_epoch,
+                None,
+            "turning_rule_start":
+                "first epoch with lid_window previous LID values",
             "lid_window":
                 args.lid_window,
             "turning_z":
