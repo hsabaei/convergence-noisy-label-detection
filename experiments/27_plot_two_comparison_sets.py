@@ -185,6 +185,9 @@ def plot_error_improvement_vs_d2l(
 
         100 * (D2L_error - method_error) / D2L_error
 
+    Only intervention methods are plotted; D2L is the reference and
+    the ordinary baseline is omitted.
+
     Positive values mean lower error than D2L.
     Negative values mean higher error than D2L.
     """
@@ -196,7 +199,9 @@ def plot_error_improvement_vs_d2l(
     all_values = []
 
     for label, df in series.items():
-        if label == "D2L":
+        # Only intervention methods are shown in the error-improvement plots.
+        # D2L is the reference and the ordinary baseline is omitted.
+        if label in {"D2L", "Baseline"}:
             continue
 
         merged = df[["epoch", metric]].merge(
