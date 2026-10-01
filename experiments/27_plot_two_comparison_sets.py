@@ -103,20 +103,56 @@ def auto_ylim(series, metric, start_epoch=40, pad=0.25, step=0.5):
     return lo, hi
 
 
+def _style_axes(ax, xlabel="Epoch", ylabel=None, title=None):
+    """Presentation-ready axis styling."""
+    if xlabel is not None:
+        ax.set_xlabel(xlabel, fontsize=17, fontweight="bold")
+    if ylabel is not None:
+        ax.set_ylabel(ylabel, fontsize=17, fontweight="bold")
+    if title is not None:
+        ax.set_title(title, fontsize=20, fontweight="bold", pad=14)
+
+    ax.tick_params(axis="both", labelsize=14)
+    for tick in ax.get_xticklabels() + ax.get_yticklabels():
+        tick.set_fontweight("bold")
+
+    ax.grid(alpha=0.25)
+
+
+def _legend_below(ax, ncol=None):
+    """Put legend centered below the plotting area."""
+    handles, labels = ax.get_legend_handles_labels()
+    if ncol is None:
+        ncol = min(3, max(1, len(labels)))
+
+    leg = ax.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncol=ncol,
+        fontsize=13,
+        frameon=True,
+    )
+    for txt in leg.get_texts():
+        txt.set_fontweight("bold")
+
+
 def plot(series, metric, title, ylabel, outpath,
          start_epoch=40, full_scale=False):
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    fig, ax = plt.subplots(figsize=(12.5, 7.5))
 
     for label, df in series.items():
         shown = df if start_epoch is None else df[df["epoch"] >= start_epoch]
-        ax.plot(shown["epoch"], 100.0 * shown[metric],
-                linewidth=2.1, label=label)
+        ax.plot(
+            shown["epoch"],
+            100.0 * shown[metric],
+            linewidth=2.6,
+            label=label,
+        )
 
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=15)
-    ax.grid(alpha=0.25)
-    ax.legend(fontsize=10)
+    _style_axes(ax, xlabel="Epoch", ylabel=ylabel, title=title)
+    _legend_below(ax)
 
     if start_epoch is not None:
         ax.set_xlim(left=start_epoch)
@@ -128,8 +164,83 @@ def plot(series, metric, title, ylabel, outpath,
     else:
         ax.set_ylim(*auto_ylim(series, metric, start_epoch=start_epoch))
 
-    fig.tight_layout()
-    fig.savefig(outpath.with_suffix(".png"), dpi=220, bbox_inches="tight")
+    fig.subplots_adjust(bottom=0.26)
+    fig.savefig(outpath.with_suffix(".png"), dpi=240, bbox_inches="tight")
+    fig.savefig(outpath.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_error_improvement_vs_d2l(
+    series,
+    d2l_df,
+    metric,
+    title,
+    ylabel,
+    outpath,
+    *,
+    start_epoch=40,
+):
+    """
+    Relative error reduction compared with D2L:
+
+        100 * (D2L_error - method_error) / D2L_error
+
+    Positive values mean lower error than D2L.
+    Negative values mean higher error than D2L.
+    """
+    fig, ax = plt.subplots(figsize=(12.5, 7.5))
+
+    d2l = d2l_df[["epoch", metric]].copy()
+    d2l["d2l_error"] = 1.0 - d2l[metric]
+
+    all_values = []
+
+    for label, df in series.items():
+        if label == "D2L":
+            continue
+
+        merged = df[["epoch", metric]].merge(
+            d2l[["epoch", "d2l_error"]],
+            on="epoch",
+            how="inner",
+        )
+
+        if start_epoch is not None:
+            merged = merged[merged["epoch"] >= start_epoch]
+
+        method_error = 1.0 - merged[metric]
+        denom = merged["d2l_error"].clip(lower=1e-12)
+        improvement = 100.0 * (
+            merged["d2l_error"] - method_error
+        ) / denom
+
+        all_values.extend(improvement.tolist())
+
+        ax.plot(
+            merged["epoch"],
+            improvement,
+            linewidth=2.6,
+            label=label,
+        )
+
+    ax.axhline(0.0, linewidth=1.5, linestyle="--")
+    _style_axes(ax, xlabel="Epoch", ylabel=ylabel, title=title)
+    _legend_below(ax)
+
+    if start_epoch is not None:
+        ax.set_xlim(left=start_epoch)
+    else:
+        ax.set_xlim(left=1)
+
+    if all_values:
+        lo = min(all_values)
+        hi = max(all_values)
+        span = max(hi - lo, 5.0)
+        pad = 0.08 * span
+        ax.set_ylim(lo - pad, hi + pad)
+
+    fig.subplots_adjust(bottom=0.26)
+    fig.savefig(outpath.with_suffix(".png"), dpi=240, bbox_inches="tight")
     fig.savefig(outpath.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
@@ -246,6 +357,39 @@ def main():
         full_scale=True,
     )
 
+
+    # Relative error improvement with respect to D2L.
+    # Positive values mean lower error than D2L.
+    plot_error_improvement_vs_d2l(
+        set2,
+        d2l,
+        metric="test",
+        title="Relative Test-Error Improvement vs D2L",
+        ylabel="Error reduction relative to D2L (%)",
+        outpath=outdir / "set2_test_error_improvement_vs_d2l",
+        start_epoch=args.zoom_start_epoch,
+    )
+
+    plot_error_improvement_vs_d2l(
+        set2,
+        d2l,
+        metric="train_all",
+        title="Relative Training-Error Improvement vs D2L",
+        ylabel="Error reduction relative to D2L (%)",
+        outpath=outdir / "set2_training_error_improvement_vs_d2l",
+        start_epoch=args.zoom_start_epoch,
+    )
+
+    plot_error_improvement_vs_d2l(
+        set2,
+        d2l,
+        metric="train_noisy",
+        title="Relative Noisy-Sample Error Improvement vs D2L",
+        ylabel="Error reduction relative to D2L (%)",
+        outpath=outdir / "set2_noisy_error_improvement_vs_d2l",
+        start_epoch=args.zoom_start_epoch,
+    )
+
     rows = []
     add_summary_rows(rows, "set1", set1)
     add_summary_rows(rows, "set2", set2)
@@ -265,6 +409,12 @@ def main():
         "set2_training_accuracy_all.pdf",
         "set2_training_accuracy_noisy.png",
         "set2_training_accuracy_noisy.pdf",
+        "set2_test_error_improvement_vs_d2l.png",
+        "set2_test_error_improvement_vs_d2l.pdf",
+        "set2_training_error_improvement_vs_d2l.png",
+        "set2_training_error_improvement_vs_d2l.pdf",
+        "set2_noisy_error_improvement_vs_d2l.png",
+        "set2_noisy_error_improvement_vs_d2l.pdf",
         "two_set_summary.csv",
     ]:
         print(outdir / name)
